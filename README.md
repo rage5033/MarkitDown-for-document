@@ -36,6 +36,18 @@ PDF/Word/PowerPoint/Excel/이미지/오디오/HTML 등 여러 파일을 한 번�
 
 ## 실행 방법
 
+### 0) 다른 PC에서 이어서 개발하기
+```powershell
+git clone https://github.com/rage5033/MarkitDown-for-document.git
+cd MarkitDown-for-document
+python -m venv .venv            # Python 3.14 권장 (현재 개발 환경)
+.\.venv\Scripts\pip install -r requirements.txt
+.\.venv\Scripts\python.exe main.py
+```
+- `.venv`, `build`, `dist`, `*.spec`은 Git에 포함되지 않으며 위 명령과 `build_exe.ps1`로 다시 생성됩니다.
+- OCR이 필요하면 해당 PC에서 `install_tesseract.bat` 실행 (Tesseract는 PC별 설치).
+- 작업 전 `git pull`, 작업 후 `git add -A; git commit -m "..."; git push`.
+
 ### 1) 개발/실행 (Python)
 ```powershell
 cd D:\01_Project\vs_code\02.MarkitDown

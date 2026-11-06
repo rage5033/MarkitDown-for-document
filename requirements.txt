@@ -6,3 +6,6 @@ markdown>=3.10
 xhtml2pdf>=0.2.18
 pathvalidate>=3.3
 pytesseract>=0.3.13
+pdfplumber>=0.11.10
+reportlab>=5.0
+Pillow>=12.0
