@@ -1,0 +1,8 @@
+markitdown[pptx,docx,xlsx,xls,pdf,outlook,audio-transcription]==0.1.7
+youtube-transcript-api>=1.2.4
+PySide6>=6.11
+pyinstaller>=6.22
+markdown>=3.10
+xhtml2pdf>=0.2.18
+pathvalidate>=3.3
+pytesseract>=0.3.13
