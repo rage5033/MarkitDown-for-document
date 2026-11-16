@@ -103,6 +103,13 @@ class ConversionWorker(QObject):
             out_path, image_dir, link_prefix, bundle_base = output_paths(
                 self._output_dir, job.output_name, job.layout, bundle
             )
+            if Path(job.source_path).suffix.lower() == ".pdf":
+                try:
+                    pdf_out, message = self._run_pdf(job, out_path.parent)
+                    self.progress.emit(row, str(pdf_out), True, message)
+                except Exception as exc:
+                    self.progress.emit(row, str(out_path), False, str(exc))
+                continue
             try:
                 out_path.parent.mkdir(parents=True, exist_ok=True)
                 sink = ImageSink(
@@ -144,6 +151,28 @@ class ConversionWorker(QObject):
             except Exception as exc:  # surface any converter error to the UI instead of crashing the thread
                 self.progress.emit(row, str(out_path), False, str(exc))
         self.finished.emit()
+
+    @staticmethod
+    def _run_pdf(job: ConversionJob, target_dir: Path) -> tuple[Path, str]:
+        """PDF goes through the layout pipeline, which writes the final MD and image-bundle PDF itself;
+        none of the ImageSink post-processing below may touch its output."""
+        from markitdown_gui import pdf_pipeline
+
+        res = pdf_pipeline.convert_pdf(job.source_path, target_dir)
+        rep, md_path = res["report"], Path(res["md"])
+        message = f"완료 (그림 {rep['figures']}개, 표 {rep['tables']}개, 수식 이미지 {rep['formulas']}개)"
+        message += f" · AI 업로드: {md_path.name} + {Path(res['images_pdf']).name} (2개)"
+        if job.save_pdf:
+            try:
+                markdown_to_pdf(md_path.read_text(encoding="utf-8"), md_path.with_suffix(".pdf"))
+                message += " + PDF"
+            except Exception as pdf_exc:
+                message += f", PDF 실패: {pdf_exc}"
+        files = [md_path, Path(res["images_pdf"]), md_path.with_suffix(".pdf")]
+        oversized = [f.name for f in files if f.is_file() and f.stat().st_size > AI_MAX_FILE_BYTES]
+        if oversized:
+            message += f" · 경고: {AI_MAX_FILE_BYTES // (1024 * 1024)}MB 초과 파일 {', '.join(oversized)}"
+        return md_path, message
 
     @staticmethod
     def _oversized_outputs(out_path: Path, image_dir: Path, bundle_base: Path, sink: ImageSink, pdf: bool) -> list[str]:
