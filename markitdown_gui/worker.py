@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 from dataclasses import dataclass
+from datetime import datetime
 from glob import escape as glob_escape
 from pathlib import Path
 
@@ -26,6 +28,24 @@ MAX_OUTPUT_PATH = 250  # Windows MAX_PATH is 260 incl. terminator; keep a margin
 MIN_STEM_LEN = 16
 _BUNDLE_SUFFIX = "_images_99.pdf"
 _IMAGE_SUFFIX = "_p999_99.png"
+# Scanned-PDF detection: a page with fewer non-space text-layer characters than SCAN_PAGE_MIN_CHARS has
+# (almost) no text; the PDF counts as scanned when more than SCAN_PAGE_RATIO of its pages are like that.
+SCAN_PAGE_MIN_CHARS = 50
+SCAN_PAGE_RATIO = 0.5
+
+
+def scan_low_text_pages(pdf_path: str | Path) -> tuple[list[int], int]:
+    """(1-based numbers of pages with almost no text layer, page count)."""
+    import pymupdf
+
+    with pymupdf.open(pdf_path) as doc:
+        low = [p.number + 1 for p in doc if len("".join(p.get_text().split())) < SCAN_PAGE_MIN_CHARS]
+        return low, doc.page_count
+
+
+def _page_list(pages: list[int], limit: int = 20) -> str:
+    text = ", ".join(map(str, pages[:limit]))
+    return text + (f" 외 {len(pages) - limit}쪽" if len(pages) > limit else "")
 
 
 def _longest_output_path(out_len: int, stem_len: int, layout: str) -> int:
@@ -155,24 +175,75 @@ class ConversionWorker(QObject):
     @staticmethod
     def _run_pdf(job: ConversionJob, target_dir: Path) -> tuple[Path, str]:
         """PDF goes through the layout pipeline, which writes the final MD and image-bundle PDF itself;
-        none of the ImageSink post-processing below may touch its output."""
+        none of the ImageSink post-processing below may touch its output. Only scanned PDFs with OCR
+        enabled (and Tesseract installed) take the legacy pdfplumber + Tesseract path."""
         from markitdown_gui import pdf_pipeline
+
+        low_pages, total = scan_low_text_pages(job.source_path)
+        scanned = len(low_pages) > SCAN_PAGE_RATIO * total
+        if scanned and job.ocr and ocr_engine.is_available():
+            return ConversionWorker._run_pdf_ocr(job, target_dir, total)
 
         res = pdf_pipeline.convert_pdf(job.source_path, target_dir, save_image_files=job.extract_images)
         rep, md_path = res["report"], Path(res["md"])
+        bundle = [Path(res["images_pdf"])] if res["images_pdf"] else []
         message = f"완료 (그림 {rep['figures']}개, 표 {rep['tables']}개, 수식 이미지 {rep['formulas']}개)"
-        message += f" · AI 업로드: {md_path.name} + {Path(res['images_pdf']).name} (2개)"
+        if bundle:
+            message += f" · AI 업로드: {md_path.name} + {bundle[0].name} (2개)"
+        else:
+            message += f" · AI 업로드: {md_path.name} (1개, 이미지 없음)"
+        if scanned:
+            hint = "OCR을 켜고" if ocr_engine.is_available() else "Tesseract를 설치하고 OCR을 켜서"
+            message += f" · 경고: 스캔 PDF로 보임 — {hint} 다시 변환하세요"
+        elif low_pages:
+            message += f" · 글자가 거의 없는 쪽: {_page_list(low_pages)}"
+        return md_path, ConversionWorker._finish_pdf(job, md_path, bundle, message)
+
+    @staticmethod
+    def _run_pdf_ocr(job: ConversionJob, target_dir: Path, pages: int) -> tuple[Path, str]:
+        from markitdown_gui import pdf_pipeline
+        from markitdown_gui.pdf_enhanced import convert_pdf as convert_scanned_pdf
+
+        src = Path(job.source_path)
+        sha = hashlib.sha256(src.read_bytes()).hexdigest()
+        target_dir.mkdir(parents=True, exist_ok=True)
+        stem, md_path, img_pdf_path = pdf_pipeline.output_names(src, target_dir, sha)
+        image_dir = target_dir / "images"
+        sink = ImageSink(image_dir if job.extract_images else None, "images/", safe_prefix(stem), ocr=True)
+        sink.clear_previous((target_dir, image_dir))
+        res = convert_scanned_pdf(src, sink)
+        bundle_base = img_pdf_path.with_name(stem + "_images")
+        bundles = sink.write_bundle(bundle_base) if job.extract_images else []
+        if not bundles:
+            sink.remove_bundles(bundle_base)
+        front = {
+            "source_file": src.name, "source_sha256": sha, "pages": pages,
+            "images_pdf": bundles[0][0] if bundles else "", "images": len(sink.entries),
+            "converter": "scanned PDF OCR / pdfplumber + tesseract",
+            "converted_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        header = "---\n" + "\n".join(f"{k}: {json.dumps(v, ensure_ascii=False)}" for k, v in front.items()) + "\n---\n\n"
+        md_path.write_text(header + res.markdown.rstrip() + sink.index_markdown(bundles) + "\n",
+                           encoding="utf-8", newline="\n")
+        message = f"완료 (스캔 PDF → OCR {sink.ocr_count}건, 이미지 {len(sink.entries)}개)"
+        if bundles:
+            message += f" · AI 업로드: {md_path.name} + {', '.join(b for b, _ in bundles)} ({1 + len(bundles)}개)"
+        extra = [img_pdf_path.with_name(b) for b, _ in bundles]
+        return md_path, ConversionWorker._finish_pdf(job, md_path, extra, message)
+
+    @staticmethod
+    def _finish_pdf(job: ConversionJob, md_path: Path, extra_files: list[Path], message: str) -> str:
         if job.save_pdf:
             try:
                 markdown_to_pdf(md_path.read_text(encoding="utf-8"), md_path.with_suffix(".pdf"))
                 message += " + PDF"
             except Exception as pdf_exc:
                 message += f", PDF 실패: {pdf_exc}"
-        files = [md_path, Path(res["images_pdf"]), md_path.with_suffix(".pdf")]
+        files = [md_path, *extra_files, md_path.with_suffix(".pdf")]
         oversized = [f.name for f in files if f.is_file() and f.stat().st_size > AI_MAX_FILE_BYTES]
         if oversized:
             message += f" · 경고: {AI_MAX_FILE_BYTES // (1024 * 1024)}MB 초과 파일 {', '.join(oversized)}"
-        return md_path, message
+        return message
 
     @staticmethod
     def _oversized_outputs(out_path: Path, image_dir: Path, bundle_base: Path, sink: ImageSink, pdf: bool) -> list[str]:

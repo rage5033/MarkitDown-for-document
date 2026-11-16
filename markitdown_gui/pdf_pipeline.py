@@ -228,6 +228,16 @@ def safe_stem(source: Path, max_len: int = 90) -> str:
     return s[:max_len].rstrip('._ ') or 'document'
 
 
+def output_names(pdf_path: Path, out_dir: Path, sha: str, stem_max: int = 90) -> tuple[str, Path, Path]:
+    """(stem, <stem>.md, <stem>_images.pdf). 같은 이름으로 '다른' 원본이 이미 변환되어 있으면
+    해시 6자리로 구분하고, 같은 원본이면 덮어쓴다. OCR 경로(worker)도 같은 규칙을 쓴다."""
+    stem = safe_stem(Path(pdf_path), stem_max)
+    md_path = Path(out_dir) / f'{stem}.md'
+    if md_path.exists() and sha not in md_path.read_text(encoding='utf-8', errors='ignore')[:3000]:
+        stem = f'{stem[:stem_max - 7]}_{sha[:6]}'
+    return stem, Path(out_dir) / f'{stem}.md', Path(out_dir) / f'{stem}_images.pdf'
+
+
 # --------------------------------------------------------------------------------------
 # 4. 텍스트(레이아웃 분석 1회 + MD 정리)
 # --------------------------------------------------------------------------------------
@@ -330,13 +340,7 @@ def convert_pdf(pdf_path, out_dir, *, dpi: int = 150, jpg_quality: int = 80, pad
     out_dir.mkdir(parents=True, exist_ok=True)
     raw = pdf_path.read_bytes()
     sha = hashlib.sha256(raw).hexdigest()
-    stem = safe_stem(pdf_path, stem_max)
-    md_path = out_dir / f'{stem}.md'
-    img_pdf_path = out_dir / f'{stem}_images.pdf'
-    # 같은 이름으로 '다른' 원본이 이미 변환되어 있으면 해시 6자리로 구분 (같은 원본이면 덮어씀)
-    if md_path.exists() and sha not in md_path.read_text(encoding='utf-8', errors='ignore')[:3000]:
-        stem = f'{stem[:stem_max - 7]}_{sha[:6]}'
-        md_path, img_pdf_path = out_dir / f'{stem}.md', out_dir / f'{stem}_images.pdf'
+    stem, md_path, img_pdf_path = output_names(pdf_path, out_dir, sha, stem_max)
 
     doc = pymupdf.open(stream=raw, filetype='pdf')
     total = doc.page_count
@@ -376,7 +380,7 @@ def convert_pdf(pdf_path, out_dir, *, dpi: int = 150, jpg_quality: int = 80, pad
         by_page.setdefault(it.page, []).append(it)
     front = {
         'source_file': pdf_path.name, 'source_sha256': sha, 'pages': total,
-        'images_pdf': img_pdf_path.name, 'images': len(items),
+        'images_pdf': img_pdf_path.name if items else '', 'images': len(items),
         'converter': f'pdf_pipeline_reference / pymupdf {pymupdf.VersionBind} / '
                      f'pymupdf4llm {getattr(pymupdf4llm, "__version__", "?")}',
         'converted_at': _dt.datetime.now().isoformat(timespec='seconds'),
@@ -392,10 +396,13 @@ def convert_pdf(pdf_path, out_dir, *, dpi: int = 150, jpg_quality: int = 80, pad
             pos = _caption_anchor(md, it.label) if it.label and it.kind in ('figure', 'table') else None
             md = (md[:pos] + link + md[pos:]) if pos is not None else (md.rstrip() + '\n\n' + link)
         parts.append(f'\n<!-- page: {n} -->\n\n{md.strip()}\n')
-    parts.append('\n---\n\n## 이미지 파일 목록\n\n'
-                 f"이 문서의 이미지는 이미지 모음 PDF('{img_pdf_path.name}')에 한 쪽에 1개씩 들어 있습니다. "
-                 '각 쪽 상단에 본문 이미지 링크와 같은 파일명이 표시되어 있습니다.\n\n'
-                 '| 파일명 | 이미지 모음 PDF | 원문 위치 | 라벨 | 영역 판정 | 설명 |\n|---|---|---|---|---|---|\n')
+    if not items:   # 그림 없는 문서(스캔 PDF 포함): 빈 PDF는 저장할 수 없으므로 이미지 모음 PDF를 만들지 않는다
+        parts.append('\n---\n\n## 이미지 파일 목록\n\n이 문서에서 추출한 그림·표·수식 이미지가 없습니다.\n')
+    else:
+        parts.append('\n---\n\n## 이미지 파일 목록\n\n'
+                     f"이 문서의 이미지는 이미지 모음 PDF('{img_pdf_path.name}')에 한 쪽에 1개씩 들어 있습니다. "
+                     '각 쪽 상단에 본문 이미지 링크와 같은 파일명이 표시되어 있습니다.\n\n'
+                     '| 파일명 | 이미지 모음 PDF | 원문 위치 | 라벨 | 영역 판정 | 설명 |\n|---|---|---|---|---|---|\n')
     for it in items:
         cap = re.sub(r'\s+', ' ', it.caption).replace('|', '/')[:200]
         parts.append(f'| {it.file_name} | {img_pdf_path.name} {it.index}쪽 | {it.page}쪽 | '
@@ -427,7 +434,9 @@ def convert_pdf(pdf_path, out_dir, *, dpi: int = 150, jpg_quality: int = 80, pad
     out.set_metadata({'title': f'{stem}_images - 이미지 모음', 'subject': pdf_path.name, 'keywords': sha})
     if items:
         out.subset_fonts()
-    out.save(img_pdf_path, garbage=3, deflate=True)
+        out.save(img_pdf_path, garbage=3, deflate=True)
+    else:
+        img_pdf_path.unlink(missing_ok=True)   # 이전 변환에서 남은 모음 PDF가 새 MD와 어긋나지 않게
 
     report = dict(source=pdf_path.name, pages=total,
                   figures=sum(1 for i in items if i.kind == 'figure'),
@@ -436,9 +445,10 @@ def convert_pdf(pdf_path, out_dir, *, dpi: int = 150, jpg_quality: int = 80, pad
                   band_regions=[i.label for i in items if i.how == 'band'],
                   captions_without_region=[r['label'] for r in regions if r['rect'] is None and r['label']],
                   skipped_orphans=skipped_orphans, text_api='internal' if strip_ok else 'public-fallback',
-                  md_bytes=md_path.stat().st_size, images_pdf_bytes=img_pdf_path.stat().st_size,
+                  md_bytes=md_path.stat().st_size,
+                  images_pdf_bytes=img_pdf_path.stat().st_size if items else 0,
                   source_bytes=len(raw))
-    return dict(md=md_path, images_pdf=img_pdf_path, items=items, report=report)
+    return dict(md=md_path, images_pdf=img_pdf_path if items else None, items=items, report=report)
 
 
 if __name__ == '__main__':
