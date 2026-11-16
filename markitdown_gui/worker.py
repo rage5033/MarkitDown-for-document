@@ -158,7 +158,7 @@ class ConversionWorker(QObject):
         none of the ImageSink post-processing below may touch its output."""
         from markitdown_gui import pdf_pipeline
 
-        res = pdf_pipeline.convert_pdf(job.source_path, target_dir)
+        res = pdf_pipeline.convert_pdf(job.source_path, target_dir, save_image_files=job.extract_images)
         rep, md_path = res["report"], Path(res["md"])
         message = f"완료 (그림 {rep['figures']}개, 표 {rep['tables']}개, 수식 이미지 {rep['formulas']}개)"
         message += f" · AI 업로드: {md_path.name} + {Path(res['images_pdf']).name} (2개)"

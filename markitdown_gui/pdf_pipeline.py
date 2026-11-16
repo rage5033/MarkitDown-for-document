@@ -283,6 +283,28 @@ def _caption_anchor(md: str, label: str) -> int | None:
 # --------------------------------------------------------------------------------------
 # 5. 변환 본체
 # --------------------------------------------------------------------------------------
+HEADER_FONT = 'kr'   # pymupdf.Font('korea')(내장 CJK, 영문 비례 폭)를 PDF에 넣어 쓴다
+
+
+def _header_line(page, font: pymupdf.Font, pos, text: str, size: float, width: float) -> None:
+    """한 줄 머리글. fontname='korea'(비내장)는 영문이 전각 폭이라 파일명이 잘렸다 → 내장 폰트 + 폭 맞춤."""
+    while font.text_length(text, size) > width and size > 6:
+        size -= 0.5
+    while len(text) > 1 and font.text_length(text, size) > width:
+        text = text[:-2] + '…'
+    page.insert_text(pos, text, fontname=HEADER_FONT, fontsize=size)
+
+
+def _header_box(page, font: pymupdf.Font, rect: pymupdf.Rect, text: str) -> None:
+    """여러 줄 머리글. insert_textbox는 넘치면 아무것도 쓰지 않으므로 글자 크기를 줄이고, 그래도 넘치면 말줄임."""
+    kw = dict(fontname=HEADER_FONT)
+    for size in (8, 7, 6.5, 6):
+        if page.insert_textbox(rect, text, fontsize=size, **kw) >= 0:
+            return
+    while len(text) > 10:
+        text = text[:int(len(text) * 0.85)].rstrip() + '…'
+        if page.insert_textbox(rect, text, fontsize=6, **kw) >= 0:
+            return
 @dataclass
 class FigureItem:
     index: int
@@ -383,13 +405,16 @@ def convert_pdf(pdf_path, out_dir, *, dpi: int = 150, jpg_quality: int = 80, pad
     # --- 이미지 모음 PDF (쪽당 1개, 머리글: 파일명 / 원문 위치 / 라벨·판정 / 설명) ------------------
     out = pymupdf.open()
     A4 = pymupdf.paper_rect('a4')
+    font = pymupdf.Font('korea')
+    text_w = A4.width - 72
     for it in items:
         p = out.new_page(width=A4.width, height=A4.height)
-        p.insert_text((36, 42), f'[{it.index}/{len(items)}] {it.file_name}', fontname='korea', fontsize=10)
-        p.insert_text((36, 58), f'원문 위치: {it.page}쪽', fontname='korea', fontsize=9)
-        p.insert_text((36, 72), f'라벨: {it.label or "-"} (영역 판정: {it.how})', fontname='korea', fontsize=9)
+        p.insert_font(fontname=HEADER_FONT, fontbuffer=font.buffer)
+        _header_line(p, font, (36, 42), f'[{it.index}/{len(items)}] {it.file_name}', 10, text_w)
+        _header_line(p, font, (36, 58), f'원문 위치: {it.page}쪽', 9, text_w)
+        _header_line(p, font, (36, 72), f'라벨: {it.label or "-"} (영역 판정: {it.how})', 9, text_w)
         cap_text = re.sub(r'\s+', ' ', it.caption)[:400]
-        p.insert_textbox(pymupdf.Rect(36, 78, A4.width - 36, 118), '설명: ' + cap_text, fontname='korea', fontsize=8)
+        _header_box(p, font, pymupdf.Rect(36, 78, A4.width - 36, 118), '설명: ' + cap_text)
         p.draw_line((36, 122), (A4.width - 36, 122), width=0.5)
         avail = pymupdf.Rect(36, 130, A4.width - 36, A4.height - 36)
         w, h = it.px
@@ -400,6 +425,8 @@ def convert_pdf(pdf_path, out_dir, *, dpi: int = 150, jpg_quality: int = 80, pad
         for it in items:
             (out_dir / 'images' / it.file_name).write_bytes(it.jpg)
     out.set_metadata({'title': f'{stem}_images - 이미지 모음', 'subject': pdf_path.name, 'keywords': sha})
+    if items:
+        out.subset_fonts()
     out.save(img_pdf_path, garbage=3, deflate=True)
 
     report = dict(source=pdf_path.name, pages=total,
