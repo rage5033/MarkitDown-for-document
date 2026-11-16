@@ -11,3 +11,4 @@ tests/*_out/
 tests/*_raw/
 Claude/
 tests/fixtures/scan/
+tests/out_*/

@@ -16,7 +16,6 @@ from markitdown_gui import ocr as ocr_engine
 from markitdown_gui.assets import (
     AI_MAX_FILE_BYTES, MAX_PREFIX_LEN, DATA_URI_IMG, ImageSink, extract_data_uri_images, safe_prefix,
 )
-from markitdown_gui.pdf_enhanced import convert_pdf
 from markitdown_gui.pdf_export import markdown_to_pdf
 
 LAYOUT_DOC_FOLDER = "doc_folder"  # out/<name>/<name>.md + images flat beside it (AI upload: Ctrl+A in one folder)
@@ -258,16 +257,6 @@ class ConversionWorker(QObject):
         def summary(extra: str = "") -> str:
             ocr_note = f", OCR {sink.ocr_count}건" if sink.ocr else ""
             return f"완료 ({extra}이미지 {len(sink.entries)}개{ocr_note})"
-
-        if Path(job.source_path).suffix.lower() == ".pdf":
-            try:
-                res = convert_pdf(job.source_path, sink)
-                if res.markdown.strip():
-                    return res.markdown, summary(f"표 {res.tables}개, ")
-                note = "텍스트 없음 - 스캔 PDF일 수 있음"
-            except Exception as exc:
-                note = f"기본 변환으로 대체: {exc}"
-            return md.convert(job.source_path).markdown, f"완료 ({note})"
 
         result = md.convert(job.source_path, keep_data_uris=True, keep_inline_images_in=KEEP_INLINE_IMAGES_IN)
         if sink.ocr:
