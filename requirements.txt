@@ -9,3 +9,7 @@ pytesseract>=0.3.13
 pdfplumber>=0.11.10
 reportlab>=5.0
 Pillow>=12.0
+# PDF layout pipeline (markitdown_gui/pdf_pipeline.py). Pinned: it uses pymupdf4llm internal API. AGPL-3.0.
+pymupdf==2.1
+pymupdf4llm==2.1
+pymupdf_layout==2.1
