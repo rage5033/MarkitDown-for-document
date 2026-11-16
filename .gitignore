@@ -4,3 +4,9 @@ dist/
 *.spec
 __pycache__/
 *.pyc
+
+# Test set: copyrighted papers and outputs derived from them (CONVERSION_FIX_SPEC.md 0.3)
+tests/fixtures/pdf/
+tests/*_out/
+tests/*_raw/
+Claude/
