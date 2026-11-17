@@ -330,17 +330,23 @@ class FigureItem:
 
 def convert_pdf(pdf_path, out_dir, *, dpi: int = 150, jpg_quality: int = 80, pad: float = 3.0,
                 stem_max: int = 90, include_orphans: bool = False, orphan_min_area: float = 0.04,
-                formula_images: str = 'garbled', save_image_files: bool = False, progress=None) -> dict:
+                formula_images: str = 'garbled', save_image_files: bool = False, progress=None,
+                stem: str | None = None, output_name: str | None = None) -> dict:
     """
     PDF 1개 변환. 반환값: dict(md, images_pdf, items, report)
     save_image_files: True면 MD 링크와 같은 경로(<out_dir>/images/<파일명>.jpg)에 개별 이미지도 저장
     progress: 선택. progress(stage: str, done: int, total: int) 콜백 (GUI 진행 표시용)
+    stem: 호출 측(pdf_naming)이 이름·중복·경로 길이를 이미 정했으면 그 이름을 그대로 쓴다
+    output_name: 사용자가 바꾼 출력 이름. 주어지면 앞머리에 output_name 항목으로 기록
     """
     pdf_path, out_dir = Path(pdf_path), Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     raw = pdf_path.read_bytes()
     sha = hashlib.sha256(raw).hexdigest()
-    stem, md_path, img_pdf_path = output_names(pdf_path, out_dir, sha, stem_max)
+    if stem:
+        md_path, img_pdf_path = out_dir / f'{stem}.md', out_dir / f'{stem}_images.pdf'
+    else:
+        stem, md_path, img_pdf_path = output_names(pdf_path, out_dir, sha, stem_max)
 
     doc = pymupdf.open(stream=raw, filetype='pdf')
     total = doc.page_count
@@ -379,7 +385,9 @@ def convert_pdf(pdf_path, out_dir, *, dpi: int = 150, jpg_quality: int = 80, pad
     for it in items:
         by_page.setdefault(it.page, []).append(it)
     front = {
-        'source_file': pdf_path.name, 'source_sha256': sha, 'pages': total,
+        'source_file': pdf_path.name, 'source_sha256': sha,
+        **({'output_name': output_name} if output_name else {}),
+        'pages': total,
         'images_pdf': img_pdf_path.name if items else '', 'images': len(items),
         'converter': f'pdf_pipeline_reference / pymupdf {pymupdf.VersionBind} / '
                      f'pymupdf4llm {getattr(pymupdf4llm, "__version__", "?")}',

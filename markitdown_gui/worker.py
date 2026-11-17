@@ -17,6 +17,7 @@ from markitdown_gui.assets import (
     AI_MAX_FILE_BYTES, MAX_PREFIX_LEN, DATA_URI_IMG, ImageSink, extract_data_uri_images, safe_prefix,
 )
 from markitdown_gui.pdf_export import markdown_to_pdf
+from markitdown_gui.pdf_naming import MAX_PATH_LEN, PdfOutputPlan, file_sha256, plan_pdf_output
 
 LAYOUT_DOC_FOLDER = "doc_folder"  # out/<name>/<name>.md + images flat beside it (AI upload: Ctrl+A in one folder)
 LAYOUT_SUBFOLDER = "subfolder"    # out/<name>.md + out/<name>_images/
@@ -45,6 +46,26 @@ def scan_low_text_pages(pdf_path: str | Path) -> tuple[list[int], int]:
 def _page_list(pages: list[int], limit: int = 20) -> str:
     text = ", ".join(map(str, pages[:limit]))
     return text + (f" 외 {len(pages) - limit}쪽" if len(pages) > limit else "")
+
+
+def plan_pdf_job(out_dir: str | Path, job: "ConversionJob") -> PdfOutputPlan:
+    """Final folder/stem for a PDF job; deterministic, so the GUI preview and the worker agree."""
+    return plan_pdf_output(out_dir, job.source_path, job.output_name, file_sha256(job.source_path),
+                           doc_folder=job.layout == LAYOUT_DOC_FOLDER, images=job.extract_images)
+
+
+def plan_notes(plan: PdfOutputPlan, output_name: str) -> str:
+    notes = ""
+    if plan.user_renamed and plan.stem != Path(output_name).stem:
+        notes += f" · 출력 이름: '{output_name}' → '{plan.md.name}'"
+    if plan.shortened_to:
+        notes += f" · 경로가 길어 파일명을 {plan.shortened_to}자로 줄임"
+    if plan.hashed:
+        notes += f" · 같은 이름의 다른 원본이 있어 '{plan.stem[-7:]}' 접미사를 붙임"
+    if plan.too_long:
+        notes += (f" · 경고: 출력 경로가 {plan.longest}자로 {MAX_PATH_LEN}자를 넘음 — "
+                  "일부 프로그램에서 열리지 않을 수 있으니 더 짧은 저장 폴더를 쓰세요")
+    return notes
 
 
 def _longest_output_path(out_len: int, stem_len: int, layout: str) -> int:
@@ -118,17 +139,17 @@ class ConversionWorker(QObject):
             row = job.row
             if self._cancelled:
                 break
+            if Path(job.source_path).suffix.lower() == ".pdf":
+                try:
+                    pdf_out, message = self._run_pdf(job, self._output_dir)
+                    self.progress.emit(row, str(pdf_out), True, message)
+                except Exception as exc:
+                    self.progress.emit(row, str(self._output_dir / job.output_name), False, str(exc))
+                continue
             bundle = job.bundle_pdf and job.extract_images
             out_path, image_dir, link_prefix, bundle_base = output_paths(
                 self._output_dir, job.output_name, job.layout, bundle
             )
-            if Path(job.source_path).suffix.lower() == ".pdf":
-                try:
-                    pdf_out, message = self._run_pdf(job, out_path.parent)
-                    self.progress.emit(row, str(pdf_out), True, message)
-                except Exception as exc:
-                    self.progress.emit(row, str(out_path), False, str(exc))
-                continue
             try:
                 out_path.parent.mkdir(parents=True, exist_ok=True)
                 sink = ImageSink(
@@ -172,18 +193,22 @@ class ConversionWorker(QObject):
         self.finished.emit()
 
     @staticmethod
-    def _run_pdf(job: ConversionJob, target_dir: Path) -> tuple[Path, str]:
+    def _run_pdf(job: ConversionJob, out_dir: Path) -> tuple[Path, str]:
         """PDF goes through the layout pipeline, which writes the final MD and image-bundle PDF itself;
         none of the ImageSink post-processing below may touch its output. Only scanned PDFs with OCR
         enabled (and Tesseract installed) take the legacy pdfplumber + Tesseract path."""
         from markitdown_gui import pdf_pipeline
 
+        plan = plan_pdf_job(out_dir, job)
         low_pages, total = scan_low_text_pages(job.source_path)
         scanned = len(low_pages) > SCAN_PAGE_RATIO * total
         if scanned and job.ocr and ocr_engine.is_available():
-            return ConversionWorker._run_pdf_ocr(job, target_dir, total)
+            return ConversionWorker._run_pdf_ocr(job, plan, total)
 
-        res = pdf_pipeline.convert_pdf(job.source_path, target_dir, save_image_files=job.extract_images)
+        res = pdf_pipeline.convert_pdf(
+            job.source_path, plan.folder, save_image_files=job.extract_images, stem=plan.stem,
+            output_name=job.output_name if plan.user_renamed else None,
+        )
         rep, md_path = res["report"], Path(res["md"])
         bundle = [Path(res["images_pdf"])] if res["images_pdf"] else []
         message = f"완료 (그림 {rep['figures']}개, 표 {rep['tables']}개, 수식 이미지 {rep['formulas']}개)"
@@ -196,27 +221,29 @@ class ConversionWorker(QObject):
             message += f" · 경고: 스캔 PDF로 보임 — {hint} 다시 변환하세요"
         elif low_pages:
             message += f" · 글자가 거의 없는 쪽: {_page_list(low_pages)}"
+        message += plan_notes(plan, job.output_name)
         return md_path, ConversionWorker._finish_pdf(job, md_path, bundle, message)
 
     @staticmethod
-    def _run_pdf_ocr(job: ConversionJob, target_dir: Path, pages: int) -> tuple[Path, str]:
-        from markitdown_gui import pdf_pipeline
+    def _run_pdf_ocr(job: ConversionJob, plan: PdfOutputPlan, pages: int) -> tuple[Path, str]:
         from markitdown_gui.pdf_enhanced import convert_pdf as convert_scanned_pdf
 
         src = Path(job.source_path)
         sha = hashlib.sha256(src.read_bytes()).hexdigest()
+        target_dir, stem, md_path = plan.folder, plan.stem, plan.md
         target_dir.mkdir(parents=True, exist_ok=True)
-        stem, md_path, img_pdf_path = pdf_pipeline.output_names(src, target_dir, sha)
         image_dir = target_dir / "images"
         sink = ImageSink(image_dir if job.extract_images else None, "images/", safe_prefix(stem), ocr=True)
         sink.clear_previous((target_dir, image_dir))
         res = convert_scanned_pdf(src, sink)
-        bundle_base = img_pdf_path.with_name(stem + "_images")
+        bundle_base = plan.images_pdf.with_name(stem + "_images")
         bundles = sink.write_bundle(bundle_base) if job.extract_images else []
         if not bundles:
             sink.remove_bundles(bundle_base)
         front = {
-            "source_file": src.name, "source_sha256": sha, "pages": pages,
+            "source_file": src.name, "source_sha256": sha,
+            **({"output_name": job.output_name} if plan.user_renamed else {}),
+            "pages": pages,
             "images_pdf": bundles[0][0] if bundles else "", "images": len(sink.entries),
             "converter": "scanned PDF OCR / pdfplumber + tesseract",
             "converted_at": datetime.now().isoformat(timespec="seconds"),
@@ -227,7 +254,8 @@ class ConversionWorker(QObject):
         message = f"완료 (스캔 PDF → OCR {sink.ocr_count}건, 이미지 {len(sink.entries)}개)"
         if bundles:
             message += f" · AI 업로드: {md_path.name} + {', '.join(b for b, _ in bundles)} ({1 + len(bundles)}개)"
-        extra = [img_pdf_path.with_name(b) for b, _ in bundles]
+        message += plan_notes(plan, job.output_name)
+        extra = [plan.images_pdf.with_name(b) for b, _ in bundles]
         return md_path, ConversionWorker._finish_pdf(job, md_path, extra, message)
 
     @staticmethod

@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
 from markitdown_gui.worker import (
     ConversionJob, ConversionWorker, LAYOUT_DOC_FOLDER, LAYOUT_SUBFOLDER, output_paths,
 )
+from markitdown_gui.pdf_naming import PdfOutputPlan, file_sha256, plan_pdf_output
 from markitdown_gui import ocr as ocr_engine
 from markitdown_gui import youtube
 from pathvalidate import sanitize_filename
@@ -45,6 +46,10 @@ SUPPORTED_FILTER = (
     "모든 파일 (*.*)"
 )
 PREVIEW_LIMIT = 1_000_000  # chars; very large documents make QTextBrowser sluggish
+
+
+def is_pdf(src: str) -> bool:
+    return Path(src).suffix.lower() == ".pdf"
 
 
 class MainWindow(QMainWindow):
@@ -327,9 +332,22 @@ class MainWindow(QMainWindow):
         save_pdf = self.pdf_checkbox.isChecked()
         out_dir = Path(output_dir)
         out_layout = self.layout_combo.currentData()
+        extract_images = self.images_checkbox.isChecked()
+        sha_cache: dict[str, str] = {}
 
-        def targets(name: str) -> list[Path]:
-            md_path = output_paths(out_dir, name, out_layout)[0]
+        def pdf_plan(src: str, name: str) -> PdfOutputPlan:
+            if src not in sha_cache:
+                sha_cache[src] = file_sha256(src)
+            return plan_pdf_output(out_dir, src, name, sha_cache[src],
+                                   doc_folder=out_layout == LAYOUT_DOC_FOLDER, images=extract_images)
+
+        def md_target(src: str, name: str) -> Path:
+            if is_pdf(src):
+                return pdf_plan(src, name).md
+            return output_paths(out_dir, name, out_layout)[0]
+
+        def targets(src: str, name: str) -> list[Path]:
+            md_path = md_target(src, name)
             return [md_path, md_path.with_suffix(".pdf")] if save_pdf else [md_path]
 
         entries: list[tuple[int, str, str]] = []
@@ -346,10 +364,16 @@ class MainWindow(QMainWindow):
                 name = f"{Path(name).stem}_{count}{Path(name).suffix}"
             names_seen[key] = count + 1
 
+            if is_pdf(src):
+                plan = pdf_plan(src, name)
+                if plan.user_renamed and plan.cleaned_name != Path(name).stem:
+                    # Show what safe_stem made of a user-typed name (forbidden chars, 90-char cap).
+                    self.log.appendPlainText(f"출력 이름 정리: '{name}' → '{plan.cleaned_name}.md'")
+                    name = plan.cleaned_name + ".md"
             self.table.item(row, 1).setText(name)
             entries.append((row, src, name))
 
-        conflicts = {row for row, _, name in entries if any(p.exists() for p in targets(name))}
+        conflicts = {row for row, src, name in entries if any(p.exists() for p in targets(src, name))}
         policy = "overwrite"
         if conflicts:
             policy = self._ask_overwrite_policy([name for row, _, name in entries if row in conflicts])
@@ -364,13 +388,13 @@ class MainWindow(QMainWindow):
                 status.setText("건너뜀")
                 continue
             if row in conflicts and policy == "rename":
-                name = self._unique_name(name, used, targets)
+                name = self._unique_name(name, used, lambda candidate, s=src: targets(s, candidate))
                 self.table.item(row, 1).setText(name)
             status.setText("대기중")
             status.setData(Qt.ItemDataRole.UserRole, None)
             jobs.append(ConversionJob(
                 row=row, source_path=src, output_name=name, save_pdf=save_pdf,
-                extract_images=self.images_checkbox.isChecked(),
+                extract_images=extract_images,
                 ocr=self.ocr_checkbox.isChecked(),
                 layout=out_layout,
                 bundle_pdf=self.bundle_checkbox.isChecked(),
@@ -378,6 +402,8 @@ class MainWindow(QMainWindow):
 
         if not jobs:
             self.log.appendPlainText("변환할 항목이 없습니다 (모두 건너뜀).")
+            return
+        if not self._confirm_unique_outputs(jobs, md_target):
             return
 
         self._output_dir = output_dir
@@ -396,6 +422,37 @@ class MainWindow(QMainWindow):
         self._worker.finished.connect(self._on_finished)
         self._worker.finished.connect(self._thread.quit)
         self._thread.start()
+
+    def _confirm_unique_outputs(self, jobs: list[ConversionJob], md_target) -> bool:
+        """Two list entries ending up with the same output MD name are flagged in the table before starting."""
+        by_name: dict[str, list[ConversionJob]] = {}
+        for job in jobs:
+            by_name.setdefault(md_target(job.source_path, job.output_name).name.lower(), []).append(job)
+        dups = [group for group in by_name.values() if len(group) > 1]
+        if not dups:
+            return True
+        lines = []
+        for group in dups:
+            rows = ", ".join(str(j.row + 1) for j in group)
+            for j in group:
+                status = self.table.item(j.row, 2)
+                status.setText("이름 중복")
+                status.setToolTip(f"행 {rows}의 출력 파일 이름이 같습니다")
+            lines.append(f"행 {rows}: {md_target(group[0].source_path, group[0].output_name).name}")
+        self.log.appendPlainText("경고: 목록 안에서 출력 이름이 같은 파일 — " + " / ".join(lines))
+        answer = QMessageBox.warning(
+            self, "출력 이름 중복",
+            "목록 안에서 같은 출력 파일 이름이 되는 항목이 있습니다.\n"
+            "표의 '이름 중복' 항목의 출력 파일명을 바꾸는 것을 권장합니다.\n\n" + "\n".join(lines)
+            + "\n\n그대로 변환할까요?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return False
+        for group in dups:
+            for j in group:
+                self.table.item(j.row, 2).setText("대기중")
+        return True
 
     def _ask_overwrite_policy(self, names: list[str]) -> str | None:
         box = QMessageBox(self)
