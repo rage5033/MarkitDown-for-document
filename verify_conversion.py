@@ -196,13 +196,23 @@ def evaluate(orig_path: Path, md_path: Path, img_path: Path | None) -> dict:
     return r
 
 
-def pair_outputs(orig_dir: Path, out_dir: Path):
+def find_mds(out_dir: Path, recursive: bool = False) -> list[Path]:
+    """recursive: 하위 폴더(GUI 문서별 폴더)까지 찾되 '_old_format' 폴더 아래는 제외."""
+    if not recursive:
+        return sorted(Path(out_dir).glob('*.md'))
+    return sorted(p for p in Path(out_dir).rglob('*.md')
+                  if '_old_format' not in p.relative_to(out_dir).parts)
+
+
+def pair_outputs(orig_dir: Path, out_dir: Path, recursive: bool = False):
     """MD마다 (원본 PDF, MD, 이미지 PDF)를 찾는다. 원본과 출력이 같은 폴더에 있어도 된다.
     새 형식: MD 앞머리의 source_file / images_pdf 사용.
-    이전 형식: 이미지 PDF를 이름 규칙으로 먼저 찾고, 나머지 PDF 중 이름 앞부분이 가장 길게 일치하는 것을 원본으로 본다."""
+    이전 형식: 이미지 PDF를 이름 규칙으로 먼저 찾고, 나머지 PDF 중 이름 앞부분이 가장 길게 일치하는 것을 원본으로 본다.
+    recursive: 이미지 PDF는 out_dir이 아니라 각 MD와 같은 폴더에서 찾는다."""
     all_pdfs = [Path(p) for p in glob.glob(str(orig_dir / '*.pdf'))]
     norm = lambda s: re.sub(r'[^0-9A-Za-z가-힣]+', '_', s).strip('_').lower()
-    for md_path in sorted(Path(out_dir).glob('*.md')):
+    for md_path in find_mds(out_dir, recursive):
+        img_dir = md_path.parent if recursive else Path(out_dir)
         md = md_path.read_text(encoding='utf-8', errors='replace')
         img = None
         m = re.search(r'^images_pdf:\s*"?(.*?)"?\s*$', md, re.M) or re.search(r"이미지 모음 PDF\('([^']+)'\)", md)
@@ -211,7 +221,7 @@ def pair_outputs(orig_dir: Path, out_dir: Path):
             names += [m.group(1), re.sub(r'[()]', '_', m.group(1))]
         names += [md_path.stem + s + '.pdf' for s in ('_images', '_image', '_ima', '')]
         for n in names:
-            c = Path(out_dir) / n
+            c = img_dir / n
             if c.exists():
                 img = c
                 break
@@ -265,12 +275,14 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--orig'); ap.add_argument('--md'); ap.add_argument('--images')
     ap.add_argument('--orig-dir'); ap.add_argument('--out-dir'); ap.add_argument('--json')
+    ap.add_argument('--recursive', action='store_true',
+                    help="out-dir 하위 폴더까지 *.md 검색('_old_format' 제외), 이미지 PDF는 각 MD 폴더에서 찾음")
     a = ap.parse_args(argv)
     rows = []
     if a.orig and a.md:
         rows.append(evaluate(Path(a.orig), Path(a.md), Path(a.images) if a.images else None))
     elif a.orig_dir and a.out_dir:
-        for o, m, i in pair_outputs(Path(a.orig_dir), Path(a.out_dir)):
+        for o, m, i in pair_outputs(Path(a.orig_dir), Path(a.out_dir), a.recursive):
             rows.append(evaluate(o, m, i))
     else:
         ap.error('--orig/--md 또는 --orig-dir/--out-dir 를 지정하세요')
