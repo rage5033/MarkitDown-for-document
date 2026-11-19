@@ -12,3 +12,4 @@ tests/*_raw/
 Claude/
 tests/fixtures/scan/
 tests/out_*/
+tests/t5_gui/
