@@ -1,4 +1,5 @@
 """Entry point for the MarkItDown batch-conversion GUI."""
+import multiprocessing
 import subprocess
 import sys
 import warnings
@@ -18,12 +19,13 @@ _relaunch_in_project_venv()
 # Audio conversion is optional; pydub's missing-ffmpeg warning only confuses users at startup.
 warnings.filterwarnings("ignore", message="Couldn't find ffmpeg or avconv")
 
-from PySide6.QtWidgets import QApplication  # noqa: E402
-
-from markitdown_gui.main_window import MainWindow  # noqa: E402
-
 
 def main() -> None:
+    # GUI imports live here: PDF conversion runs in spawned child processes, which re-import this module.
+    from PySide6.QtWidgets import QApplication
+
+    from markitdown_gui.main_window import MainWindow
+
     app = QApplication(sys.argv)
     window = MainWindow()
     window.show()
@@ -31,4 +33,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()  # needed for the PDF child processes in the PyInstaller exe
     main()

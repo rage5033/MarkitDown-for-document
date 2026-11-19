@@ -29,7 +29,8 @@ from PySide6.QtWidgets import (
 )
 
 from markitdown_gui.worker import (
-    ConversionJob, ConversionWorker, LAYOUT_DOC_FOLDER, LAYOUT_SUBFOLDER, output_paths,
+    ConversionJob, ConversionWorker, LAYOUT_DOC_FOLDER, LAYOUT_SUBFOLDER, STAGE_FRACTION, STAGE_TEXT,
+    output_paths,
 )
 from markitdown_gui.pdf_naming import PdfOutputPlan, file_sha256, plan_pdf_output
 from markitdown_gui import ocr as ocr_engine
@@ -46,6 +47,7 @@ SUPPORTED_FILTER = (
     "모든 파일 (*.*)"
 )
 PREVIEW_LIMIT = 1_000_000  # chars; very large documents make QTextBrowser sluggish
+PROGRESS_PER_FILE = 1000   # progress-bar units per file, so in-file stages can move the bar
 
 
 def is_pdf(src: str) -> bool:
@@ -64,6 +66,9 @@ class MainWindow(QMainWindow):
         self._worker: ConversionWorker | None = None
         self._output_dir = ""
         self._success_count = 0
+        self._fail_count = 0
+        self._files_done = 0
+        self._job_count = 0
         self._last_success_path = ""
 
         self._build_ui()
@@ -186,6 +191,8 @@ class MainWindow(QMainWindow):
         self.progress = QProgressBar()
         conv_row.addWidget(self.progress)
         layout.addLayout(conv_row)
+        self.stage_label = QLabel("")
+        layout.addWidget(self.stage_label)
 
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
@@ -408,9 +415,12 @@ class MainWindow(QMainWindow):
 
         self._output_dir = output_dir
         self._success_count = 0
+        self._fail_count = 0
         self.settings.setValue("output_dir", output_dir)
         self._set_running(True)
-        self.progress.setMaximum(len(jobs))
+        self._files_done = 0
+        self._job_count = len(jobs)
+        self.progress.setMaximum(len(jobs) * PROGRESS_PER_FILE)
         self.progress.setValue(0)
         self.log.appendPlainText(f"--- 변환 시작: {len(jobs)}개 파일 → {output_dir} ---")
 
@@ -419,6 +429,7 @@ class MainWindow(QMainWindow):
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
         self._worker.progress.connect(self._on_progress)
+        self._worker.stage.connect(self._on_stage)
         self._worker.finished.connect(self._on_finished)
         self._worker.finished.connect(self._thread.quit)
         self._thread.start()
@@ -520,14 +531,29 @@ class MainWindow(QMainWindow):
         self.preview_raw.setPlainText(text)
 
     # ----------------------------------------------------------- Callbacks
+    def _on_stage(self, row: int, stage: str, done: int, total: int) -> None:
+        name = Path(self.table.item(row, 0).text()).name
+        text = STAGE_TEXT.get(stage, "변환 중")
+        frac = STAGE_FRACTION.get(stage, 0.0)
+        if stage == "render" and total:
+            text += f" ({done}/{total}쪽)"
+            frac += (1.0 - frac) * min(done / total, 1.0)
+        self.table.item(row, 2).setText(f"변환 중: {text}")
+        self.stage_label.setText(f"[{self._files_done + 1}/{self._job_count}] {name} — {text}")
+        self.progress.setValue(int((self._files_done + frac * 0.99) * PROGRESS_PER_FILE))
+
     def _on_progress(self, row: int, out_path: str, success: bool, message: str) -> None:
         status = self.table.item(row, 2)
         status.setText("완료" if success else "실패")
+        status.setToolTip("" if success else message)
         if success:
             status.setData(Qt.ItemDataRole.UserRole, out_path)
             self._success_count += 1
             self._last_success_path = out_path
-        self.progress.setValue(self.progress.value() + 1)
+        else:
+            self._fail_count += 1
+        self._files_done += 1
+        self.progress.setValue(self._files_done * PROGRESS_PER_FILE)
         self.log.appendPlainText(f"[{'성공' if success else '오류'}] {out_path} - {message}")
         if row == self.table.currentRow():
             self._update_preview()
@@ -540,7 +566,9 @@ class MainWindow(QMainWindow):
                 status.setText("취소됨")
                 cancelled += 1
         self._set_running(False)
-        summary = f"성공 {self._success_count}건" + (f", 취소 {cancelled}건" if cancelled else "")
+        self.stage_label.setText("")
+        summary = f"성공 {self._success_count}건" + (f", 오류 {self._fail_count}건" if self._fail_count else "") \
+            + (f", 취소 {cancelled}건" if cancelled else "")
         self.log.appendPlainText(f"--- 변환 종료 ({summary}) ---")
         if self.open_folder_checkbox.isChecked() and self._success_count:
             # A single document opens straight into its folder, ready for Ctrl+A -> drag to the AI chat.

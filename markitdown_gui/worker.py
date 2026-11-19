@@ -10,14 +10,20 @@ from glob import escape as glob_escape
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Signal
-from markitdown import MarkItDown
 
 from markitdown_gui import ocr as ocr_engine
 from markitdown_gui.assets import (
     AI_MAX_FILE_BYTES, MAX_PREFIX_LEN, DATA_URI_IMG, ImageSink, extract_data_uri_images, safe_prefix,
 )
-from markitdown_gui.pdf_export import markdown_to_pdf
 from markitdown_gui.pdf_naming import MAX_PATH_LEN, PdfOutputPlan, file_sha256, plan_pdf_output
+from markitdown_gui.pdf_process import run_pdf_in_process
+
+
+def markdown_to_pdf(markdown_text: str, output_path) -> None:
+    # Imported on use: the PDF child process loads this module and should not pay for xhtml2pdf.
+    from markitdown_gui.pdf_export import markdown_to_pdf as _impl
+
+    _impl(markdown_text, output_path)
 
 LAYOUT_DOC_FOLDER = "doc_folder"  # out/<name>/<name>.md + images flat beside it (AI upload: Ctrl+A in one folder)
 LAYOUT_SUBFOLDER = "subfolder"    # out/<name>.md + out/<name>_images/
@@ -35,12 +41,27 @@ SCAN_PAGE_RATIO = 0.5
 
 
 def scan_low_text_pages(pdf_path: str | Path) -> tuple[list[int], int]:
-    """(1-based numbers of pages with almost no text layer, page count)."""
+    """(1-based numbers of pages with almost no text layer, page count). Also the first place a PDF is
+    opened, so damaged/encrypted files fail here with a message the user can act on."""
     import pymupdf
 
-    with pymupdf.open(pdf_path) as doc:
+    try:
+        doc = pymupdf.open(pdf_path)
+    except Exception as exc:
+        raise ValueError(f"PDF 파일이 손상되었거나 열 수 없습니다 ({exc})") from exc
+    with doc:
+        if doc.needs_pass:
+            raise ValueError("암호가 걸린 PDF입니다 — 암호를 해제한 뒤 다시 변환하세요")
+        if doc.page_count == 0:
+            raise ValueError("PDF에 쪽이 없습니다 (손상된 파일일 수 있음)")
         low = [p.number + 1 for p in doc if len("".join(p.get_text().split())) < SCAN_PAGE_MIN_CHARS]
         return low, doc.page_count
+
+
+STAGE_TEXT = {"start": "준비", "layout": "레이아웃 분석", "regions": "그림·표 영역 찾기", "render": "그림 렌더링",
+              "ocr": "OCR"}
+# Share of one file's progress-bar span reached when each stage starts (render then fills up to 1.0).
+STAGE_FRACTION = {"start": 0.0, "layout": 0.02, "regions": 0.6, "render": 0.65, "ocr": 0.05}
 
 
 def _page_list(pages: list[int], limit: int = 20) -> str:
@@ -52,6 +73,27 @@ def plan_pdf_job(out_dir: str | Path, job: "ConversionJob") -> PdfOutputPlan:
     """Final folder/stem for a PDF job; deterministic, so the GUI preview and the worker agree."""
     return plan_pdf_output(out_dir, job.source_path, job.output_name, file_sha256(job.source_path),
                            doc_folder=job.layout == LAYOUT_DOC_FOLDER, images=job.extract_images)
+
+
+def _mb(n: int) -> str:
+    return f"{n / 1e6:.1f}MB"
+
+
+def report_summary(res: dict) -> str:
+    """Per-file log line from convert_pdf's report: what a person still has to check, and sizes."""
+    rep = res["report"]
+    bundle = Path(res["images_pdf"]).name if res["images_pdf"] else ""
+    notes = ""
+    band = [it for it in res["items"] if it.how == "band"]
+    if band:
+        where = ", ".join(f"{it.label} ({bundle} {it.index}쪽, 원문 {it.page}쪽)" for it in band)
+        notes += f" · 확인 필요(band 영역) {len(band)}개: {where}"
+    if rep["captions_without_region"]:
+        notes += f" · 영역을 못 찾은 캡션: {', '.join(rep['captions_without_region'])}"
+    out = rep["md_bytes"] + rep["images_pdf_bytes"]
+    notes += (f" · 용량 원본 {_mb(rep['source_bytes'])} → MD {_mb(rep['md_bytes'])} + 이미지 PDF "
+              f"{_mb(rep['images_pdf_bytes'])} ({out / max(1, rep['source_bytes']) * 100:.0f}%)")
+    return notes
 
 
 def plan_notes(plan: PdfOutputPlan, output_name: str) -> str:
@@ -122,6 +164,8 @@ class ConversionJob:
 class ConversionWorker(QObject):
     # row, output_path, success, message
     progress = Signal(int, str, bool, str)
+    # row, stage ("start" | "layout" | "regions" | "render" | "ocr"), done, total  — within one file
+    stage = Signal(int, str, int, int)
     finished = Signal()
 
     def __init__(self, jobs: list[ConversionJob], output_dir: str):
@@ -134,14 +178,17 @@ class ConversionWorker(QObject):
         self._cancelled = True
 
     def run(self) -> None:
-        md = MarkItDown(enable_plugins=False)
+        md = None
         for job in self._jobs:
             row = job.row
             if self._cancelled:
                 break
+            self.stage.emit(row, "start", 0, 0)
             if Path(job.source_path).suffix.lower() == ".pdf":
                 try:
-                    pdf_out, message = self._run_pdf(job, self._output_dir)
+                    # Called from this worker thread; the signal hands it to the GUI thread (queued).
+                    report = lambda stage, done, total, r=row: self.stage.emit(r, stage, done, total)
+                    pdf_out, message = run_pdf_in_process(job, self._output_dir, report)
                     self.progress.emit(row, str(pdf_out), True, message)
                 except Exception as exc:
                     self.progress.emit(row, str(self._output_dir / job.output_name), False, str(exc))
@@ -157,6 +204,10 @@ class ConversionWorker(QObject):
                     safe_prefix(out_path.stem), ocr=job.ocr,
                 )
                 sink.clear_previous((out_path.parent, out_path.parent / "images"))
+                if md is None:
+                    from markitdown import MarkItDown
+
+                    md = MarkItDown(enable_plugins=False)
                 markdown, message = self._convert(md, job, sink)
                 bundles = sink.write_bundle(bundle_base) if bundle else []
                 if not bundle:
@@ -193,21 +244,23 @@ class ConversionWorker(QObject):
         self.finished.emit()
 
     @staticmethod
-    def _run_pdf(job: ConversionJob, out_dir: Path) -> tuple[Path, str]:
+    def _run_pdf(job: ConversionJob, out_dir: Path, progress=None) -> tuple[Path, str]:
         """PDF goes through the layout pipeline, which writes the final MD and image-bundle PDF itself;
         none of the ImageSink post-processing below may touch its output. Only scanned PDFs with OCR
         enabled (and Tesseract installed) take the legacy pdfplumber + Tesseract path."""
         from markitdown_gui import pdf_pipeline
 
-        plan = plan_pdf_job(out_dir, job)
         low_pages, total = scan_low_text_pages(job.source_path)
+        plan = plan_pdf_job(out_dir, job)
         scanned = len(low_pages) > SCAN_PAGE_RATIO * total
         if scanned and job.ocr and ocr_engine.is_available():
+            if progress:
+                progress("ocr", 0, total)
             return ConversionWorker._run_pdf_ocr(job, plan, total)
 
         res = pdf_pipeline.convert_pdf(
             job.source_path, plan.folder, save_image_files=job.extract_images, stem=plan.stem,
-            output_name=job.output_name if plan.user_renamed else None,
+            output_name=job.output_name if plan.user_renamed else None, progress=progress,
         )
         rep, md_path = res["report"], Path(res["md"])
         bundle = [Path(res["images_pdf"])] if res["images_pdf"] else []
@@ -216,6 +269,7 @@ class ConversionWorker(QObject):
             message += f" · AI 업로드: {md_path.name} + {bundle[0].name} (2개)"
         else:
             message += f" · AI 업로드: {md_path.name} (1개, 이미지 없음)"
+        message += report_summary(res)
         if scanned:
             hint = "OCR을 켜고" if ocr_engine.is_available() else "Tesseract를 설치하고 OCR을 켜서"
             message += f" · 경고: 스캔 PDF로 보임 — {hint} 다시 변환하세요"
@@ -281,7 +335,7 @@ class ConversionWorker(QObject):
         return [f.name for f in files if f.is_file() and f.stat().st_size > AI_MAX_FILE_BYTES]
 
     @staticmethod
-    def _convert(md: MarkItDown, job: ConversionJob, sink: ImageSink) -> tuple[str, str]:
+    def _convert(md: "MarkItDown", job: ConversionJob, sink: ImageSink) -> tuple[str, str]:
         def summary(extra: str = "") -> str:
             ocr_note = f", OCR {sink.ocr_count}건" if sink.ocr else ""
             return f"완료 ({extra}이미지 {len(sink.entries)}개{ocr_note})"
