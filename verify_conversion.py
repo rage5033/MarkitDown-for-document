@@ -19,6 +19,11 @@ verify_conversion.py — 원본 PDF ↔ (MD + 이미지 모음 PDF) 정합성 �
   formulas         깨진 수식 문자가 있으면 이미지 모음 PDF에 수식 이미지(라벨 'Eq …')가 1개 이상 있어야 함
   figures/tables   원문 캡션 라벨이 이미지 모음 PDF에 모두 있어야 함
   labels           라벨 중복 없음, 라벨의 원문 쪽이 캡션 쪽과 ±1쪽 이내
+측정 모드
+  기본             원문 블록을 그대로 사용
+  재조립           한 줄짜리 블록에 든 글자가 전체의 30%를 넘는 문서: 세로로 이어지고(줄 간격 ≤ 글자 크기×1.6) 왼쪽 시작이 같은(±3pt)
+                   한 줄 블록을 합친 뒤 본문 블록 기준 적용, 12자 조각은 블록마다 따로 자름
+  측정 본문(표본)이 2,000자 미만이면 coverage·order는 '판정 불가'로 표시하고 합격 수에 넣지 않음
 경고 (판정에는 영향 없음, 표시만)
   garbled 개수, 3번 이상 반복되는 30자 이상 줄(머리글·스탬프), 캡션 없는 이미지, 작은/빈 이미지, 'band' 판정 영역
 """
@@ -84,9 +89,39 @@ def _natkey(s: str):
 
 
 # ---------------------------------------------------------------- 원문
+REASSEMBLE_SINGLE_RATIO = 0.3   # 한 줄짜리 블록에 든 글자가 전체 글자의 30%를 넘으면 '줄 재조립 모드'
+MODE_BORDER = (0.2, 0.4)        # 이 사이면 '측정 모드 경계' 경고
+REASSEMBLE_LINE_GAP = 1.6       # 줄 간격(윗줄 시작→아랫줄 시작) ≤ 글자 크기 × 1.6
+REASSEMBLE_X_TOL = 3.0          # 왼쪽 시작 위치 차이 ±3pt
+MIN_SAMPLE_CHARS = 2000         # 측정 본문이 이보다 적으면 coverage·order '판정 불가'
+
+
+def _reassemble(raw: list[dict]) -> list[list[str]]:
+    """한 줄 블록 가운데 세로로 이어지고 왼쪽 시작이 같은 것들을 한 블록으로 합친다(쪽 안에서만)."""
+    out, cur = [], None
+    for b in raw:
+        single = len(b['lines']) == 1
+        if (single and cur is not None and cur['page'] == b['page']
+                and abs(b['x0'] - cur['x0']) <= REASSEMBLE_X_TOL
+                and 0 < b['y0'] - cur['last_y0'] <= REASSEMBLE_LINE_GAP * max(cur['size'], b['size'])):
+            cur['lines'].append(b['lines'][0])
+            cur['last_y0'], cur['size'] = b['y0'], b['size']
+            continue
+        if cur is not None:
+            out.append(cur['lines'])
+        if single:
+            cur = dict(page=b['page'], x0=b['x0'], last_y0=b['y0'], size=b['size'], lines=list(b['lines']))
+        else:
+            out.append(b['lines'])
+            cur = None
+    if cur is not None:
+        out.append(cur['lines'])
+    return out
+
+
 def read_original(path: Path) -> dict:
     doc = pymupdf.open(path)
-    blocks, captions = [], {}
+    blocks, captions, raw = [], {}, []
     for p in doc:
         for b in p.get_text('dict')['blocks']:
             if b.get('type') != 0:
@@ -95,6 +130,9 @@ def read_original(path: Path) -> dict:
             lines = [x for x in lines if x]
             if not lines:
                 continue
+            sizes = [s['size'] for l in b['lines'] for s in l['spans'] if s['text'].strip()]
+            raw.append(dict(page=p.number, x0=b['bbox'][0], y0=b['bbox'][1],
+                            size=max(sizes) if sizes else 10.0, lines=lines))
             lab = label_of(lines[0]) or label_of(' '.join(lines[:2]))
             if not lab:   # 캡션 앞에 그림 안의 짧은 글자(축 라벨 등)가 같은 블록으로 붙은 경우
                 for j in range(1, min(6, len(lines))):
@@ -105,7 +143,14 @@ def read_original(path: Path) -> dict:
                 captions[lab] = p.number + 1
             if is_body_block(lines):
                 blocks.append(lines)
-    return dict(pages=doc.page_count, blocks=blocks, captions=captions, bytes=path.stat().st_size)
+    chars = sum(sum(map(len, b['lines'])) for b in raw)
+    single_chars = sum(len(b['lines'][0]) for b in raw if len(b['lines']) == 1)
+    single_ratio = single_chars / chars if chars else 0.0
+    mode = 'reassembled' if single_ratio > REASSEMBLE_SINGLE_RATIO else 'normal'
+    if mode == 'reassembled':
+        blocks = [ls for ls in _reassemble(raw) if is_body_block(ls)]
+    return dict(pages=doc.page_count, blocks=blocks, captions=captions, bytes=path.stat().st_size, mode=mode,
+                single_ratio=single_ratio)
 
 
 # ---------------------------------------------------------------- MD
@@ -122,7 +167,11 @@ def text_metrics(orig: dict, md: str) -> dict:
     _, plain = split_md(md)
     nb = clean(plain)
     allt = clean(''.join(''.join(b) for b in orig['blocks']))
-    sh = [allt[i:i + 12] for i in range(0, max(0, len(allt) - 12), 12)]
+    if orig.get('mode') == 'reassembled':   # 조각을 블록마다 따로: 블록 경계를 넘는 조각은 만들지 않는다
+        sh = [t[i:i + 12] for t in (clean(''.join(b)) for b in orig['blocks'])
+              for i in range(0, max(0, len(t) - 12), 12)]
+    else:
+        sh = [allt[i:i + 12] for i in range(0, max(0, len(allt) - 12), 12)]
     coverage = sum(1 for s in sh if s in nb) / max(1, len(sh))
     pairs = [(clean(b[j]), clean(b[j + 1])) for b in orig['blocks'] for j in range(len(b) - 1)
              if len(clean(b[j])) >= 25 and len(clean(b[j + 1])) >= 25]
@@ -131,7 +180,8 @@ def text_metrics(orig: dict, md: str) -> dict:
     glued = sum(1 for w in words if len(re.sub(r'[^A-Za-z]', '', w)) >= 22) / max(1, len(words))
     lines = [l.strip() for l in plain.split('\n') if len(l.strip()) >= 30]
     rep = {l for l in set(lines) if lines.count(l) >= 3}
-    return dict(coverage=coverage, order=order, glued=glued,
+    return dict(coverage=coverage, order=order, glued=glued, mode=orig.get('mode', 'normal'), sample_chars=len(allt),
+                single_ratio=orig.get('single_ratio', 0.0),
                 page_markers=len(re.findall(r'<!--\s*page:\s*\d+\s*-->', md)),
                 garbled=len(GARBLED.findall(plain)), repeated_lines=len(rep),
                 repeated_example=(sorted(rep)[0][:80] if rep else ''))
@@ -201,9 +251,10 @@ def evaluate(orig_path: Path, md_path: Path, img_path: Path | None) -> dict:
     out_bytes = md_path.stat().st_size + (img_path.stat().st_size if img_path and img_path.exists() else 0)
     r['source_bytes'], r['output_bytes'] = orig['bytes'], out_bytes
     r['size_ratio'] = out_bytes / orig['bytes']
+    undetermined = r['sample_chars'] < MIN_SAMPLE_CHARS
     checks = {
-        'coverage': r['coverage'] >= THRESHOLDS['coverage'],
-        'order': r['order'] >= THRESHOLDS['order'],
+        'coverage': None if undetermined else r['coverage'] >= THRESHOLDS['coverage'],
+        'order': None if undetermined else r['order'] >= THRESHOLDS['order'],
         'glued': r['glued'] <= THRESHOLDS['glued_max'],
         'pages': r['page_markers'] >= orig['pages'],
         'formulas': r['garbled'] == 0 or r['formula_items'] > 0,
@@ -212,7 +263,8 @@ def evaluate(orig_path: Path, md_path: Path, img_path: Path | None) -> dict:
         'labels': not r['duplicate_labels'] and not r['label_page_mismatch'],
     }
     r['checks'] = checks
-    r['pass'] = all(checks.values())
+    r['undetermined'] = undetermined   # 표본 부족: coverage·order를 판정하지 않고, 합격 수에도 넣지 않음
+    r['pass'] = all(v is True for v in checks.values())
     return r
 
 
@@ -242,7 +294,7 @@ def pair_outputs(orig_dir: Path, out_dir: Path, recursive: bool = False):
         names += [md_path.stem + s + '.pdf' for s in ('_images', '_image', '_ima', '')]
         for n in names:
             c = img_dir / n
-            if c.exists():
+            if n and c.is_file():
                 img = c
                 break
         orig = None
@@ -262,17 +314,30 @@ def pair_outputs(orig_dir: Path, out_dir: Path, recursive: bool = False):
 
 
 def print_table(rows):
-    h = (f"{'원본':34s} {'cover':>6} {'order':>6} {'glued':>6} {'page':>7} {'garb':>5} {'Eq':>3} {'rep':>4} "
-         f"{'그림':>7} {'표':>5} {'size':>6}  판정")
+    h = (f"{'원본':34s} {'모드':>4} {'한줄':>4} {'표본':>6} {'cover':>6} {'order':>6} {'glued':>6} {'page':>7} {'garb':>5} {'Eq':>3} "
+         f"{'rep':>4} {'그림':>7} {'표':>5} {'size':>6}  판정")
     print(h)
     print('-' * len(h))
     for r in rows:
-        verdict = 'PASS' if r['pass'] else 'FAIL: ' + ','.join(k for k, v in r['checks'].items() if not v)
-        print(f"{r['original'][:34]:34s} {r['coverage']*100:5.1f}% {r['order']*100:5.1f}% {r['glued']*100:5.2f}% "
+        failed = [k for k, v in r['checks'].items() if v is False]
+        if failed:
+            verdict = 'FAIL: ' + ','.join(failed)
+            if r.get('undetermined'):
+                verdict += f" / coverage·order 판정 불가(표본 {r['sample_chars']}자)"
+        elif r.get('undetermined'):
+            verdict = f"판정 불가(표본 {r['sample_chars']}자)"
+        else:
+            verdict = 'PASS'
+        mode = '재조립' if r.get('mode') == 'reassembled' else '기본'
+        print(f"{r['original'][:34]:34s} {mode:>4} {r.get('single_ratio', 0)*100:3.0f}% {r.get('sample_chars', 0):>6} "
+              f"{r['coverage']*100:5.1f}% {r['order']*100:5.1f}% {r['glued']*100:5.2f}% "
               f"{r['page_markers']:>3}/{r['pages']:<3} {r['garbled']:>5} {r['formula_items']:>3} {r['repeated_lines']:>4} "
               f"{r['fig_found']:>3}/{r['fig_expected']:<3} {r['table_found']:>2}/{r['table_expected']:<2} "
               f"{r['size_ratio']*100:5.1f}%  {verdict}")
         d = []
+        if MODE_BORDER[0] <= r.get('single_ratio', 0) <= MODE_BORDER[1]:
+            d.append(f"측정 모드 경계: 한 줄 블록 글자 비율 {r['single_ratio']*100:.0f}% (기준 "
+                     f"{REASSEMBLE_SINGLE_RATIO*100:.0f}%, 경계 {MODE_BORDER[0]*100:.0f}–{MODE_BORDER[1]*100:.0f}%)")
         if r['fig_missing']: d.append('그림 누락 ' + ', '.join(r['fig_missing']))
         if r['table_missing']: d.append('표 누락 ' + ', '.join(r['table_missing']))
         if r['duplicate_labels']: d.append('라벨 중복 ' + ', '.join(r['duplicate_labels']))
@@ -286,7 +351,10 @@ def print_table(rows):
     n = len(rows)
     if n:
         so, sb = sum(r['output_bytes'] for r in rows), sum(r['source_bytes'] for r in rows)
-        print(f"\n합계 {n}편: 합격 {sum(r['pass'] for r in rows)}편 | 그림 {sum(r['fig_found'] for r in rows)}/"
+        print(f"\n합계 {n}편: 합격 {sum(r['pass'] for r in rows)}편"
+              + (f", 판정 불가 {sum(1 for r in rows if r.get('undetermined'))}편"
+                 if any(r.get('undetermined') for r in rows) else "")
+              + f" | 그림 {sum(r['fig_found'] for r in rows)}/"
               f"{sum(r['fig_expected'] for r in rows)} | 표 {sum(r['table_found'] for r in rows)}/"
               f"{sum(r['table_expected'] for r in rows)} | 용량 {sb/1e6:.1f} MB → {so/1e6:.1f} MB ({so/sb*100:.1f}%)")
 
