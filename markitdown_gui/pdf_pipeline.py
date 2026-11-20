@@ -378,6 +378,22 @@ def tidy_md(md: str) -> str:
     return md
 
 
+# 중국어 공백 정리. 반각 한글(U+FFA0–FFDC)은 전각 영역(U+FF00–FFEF) 안에 있지만 한글이므로 뺀다.
+_HAN = '\u3400-\u4dbf\u4e00-\u9fff'
+_CJK = _HAN + '\u3040-\u30ff\u3000-\u303f\uff00-\uff9f\uffdd-\uffef'
+_CJK_SPACE = re.compile(rf'(?<=[{_CJK}])[ \t]+(?=[{_CJK}])')
+_DIGIT_HAN = re.compile(rf'(?<=[0-9])[ \t]+(?=[{_HAN}])|(?<=[{_HAN}])[ \t]+(?=[0-9])')
+_BEFORE_CLOSE = re.compile(r'(?<=[^\s\uac00-\ud7a3\u1100-\u11ff\u3130-\u318f])[ \t]+(?=[。，、；：！？）」』】])')
+
+
+def cjk_spacing(md: str) -> str:
+    """한자·가나·CJK 구두점·전각 문자 사이, 숫자와 한자 사이, CJK 닫는 구두점 앞의 공백을 지운다
+    (줄바꿈은 그대로). 한글이 붙은 공백은 건드리지 않는다."""
+    md = _CJK_SPACE.sub('', md)
+    md = _DIGIT_HAN.sub('', md)
+    return _BEFORE_CLOSE.sub('', md)
+
+
 def _caption_anchor(md: str, label: str) -> int | None:
     """쪽 MD 안에서 캡션 줄의 시작 위치를 찾는다(그림 링크를 캡션 바로 앞에 넣기 위함)."""
     kind, num = label.split(' ', 1)
@@ -394,7 +410,8 @@ def _caption_anchor(md: str, label: str) -> int | None:
         digits = ''.join(f'[{ch}{chr(ord(ch) + 0xFEE0)}]' if ch.isdigit() else f'[{re.escape(ch)}．－]'
                          for ch in num)
         word = '表' if kind == 'Table' else '[图圖]'
-        m = re.search(rf'^[ \t>*_#]*{word}\s*{digits}(?=[\s\u3000.:：．]|$)', md, re.M)
+        # pymupdf4llm은 번호만 굵게 쓰기도 한다: '图 **1** 大规模…'
+        m = re.search(rf'^[ \t>*_#]*{word}\s*\**\s*{digits}\**(?=[\s\u3000.:：．]|$)', md, re.M)
     return m.start() if m else None
 
 
@@ -559,6 +576,8 @@ def convert_pdf(pdf_path, out_dir, *, dpi: int = 150, jpg_quality: int = 80, pad
             link = f'![{it.label or "Image"}](images/{it.file_name})\n\n'
             pos = _caption_anchor(md, it.label) if it.label and it.kind in ('figure', 'table') else None
             md = (md[:pos] + link + md[pos:]) if pos is not None else (md.rstrip() + '\n\n' + link)
+        # 공백 정리는 마지막에: 캡션 위치 찾기는 '图 1 …'(번호 뒤 공백)를 기준으로 하기 때문
+        md = cjk_spacing(md)
         parts.append(f'\n<!-- page: {n} -->\n\n{md.strip()}\n')
     if not items:   # 그림 없는 문서(스캔 PDF 포함): 빈 PDF는 저장할 수 없으므로 이미지 모음 PDF를 만들지 않는다
         parts.append('\n---\n\n## 이미지 파일 목록\n\n이 문서에서 추출한 그림·표·수식 이미지가 없습니다.\n')

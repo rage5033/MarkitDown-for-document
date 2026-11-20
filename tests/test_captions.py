@@ -114,6 +114,35 @@ class SplitCaptionMarkdown(unittest.TestCase):
         self.assertEqual(P._mark_mixed_table(clean, it), clean)
 
 
+class CjkSpacing(unittest.TestCase):
+    def test_link_anchor_finds_bold_chinese_number(self):
+        md = "正文 (图1)。\n\n图 **1** 大规模储能技术分类 \n\n**Fig. 1 Large-scale**\n"
+        self.assertEqual(md[P._caption_anchor(md, "Fig 1"):].split("\n")[0], "图 **1** 大规模储能技术分类 ")
+
+    def test_removes_spaces_between_cjk_digits_and_before_closing_punct(self):
+        cases = {
+            "上游锂矿石原料 价格急剧波动": "上游锂矿石原料价格急剧波动",
+            "2022 年以来": "2022年以来",
+            "约 20 ℃": "约20 ℃",
+            "安全隐患<sup>[4]</sup> 。 2022 年": "安全隐患<sup>[4]</sup>。 2022年",   # 구두점-숫자 사이는 규칙 밖
+            "（ 1 ）采用": "（ 1）采用",
+            "表 6 所 示。": "表6所示。",
+            "PCS 一 一对应": "PCS 一一对应",
+            "Fig. 1 Temperature variation": "Fig. 1 Temperature variation",
+        }
+        for src, want in cases.items():
+            with self.subTest(src=src):
+                self.assertEqual(P.cjk_spacing(src), want)
+
+    def test_line_breaks_are_kept(self):
+        self.assertEqual(P.cjk_spacing("原料\n价格"), "原料\n价格")
+
+    def test_hangul_neighbours_untouched(self):
+        for s in ("한글 中文", "中文 한글", "설명 。", "표 1", "원문 위치: 2쪽", "한글 ）"):
+            with self.subTest(s=s):
+                self.assertEqual(P.cjk_spacing(s), s)
+
+
 class CjkBodyBlocks(unittest.TestCase):
     def test_han_lines_use_20_chars_and_english_lines_keep_40(self):
         self.assertTrue(V.is_body_block(["钠离子电池作为一种新型的电化学储能技术具有", "资源丰富安全性高高低温性能优异高倍率充放"]))
