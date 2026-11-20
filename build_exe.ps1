@@ -15,6 +15,10 @@ Set-Location $PSScriptRoot
     --collect-all pdfplumber `
     --collect-all pypdfium2 `
     --collect-all pypdfium2_raw `
+    --collect-all pymupdf `
+    --collect-all pymupdf4llm `
+    --collect-all pymupdf_layout `
+    --collect-all onnxruntime `
     main.py
 
 Write-Host "빌드 완료: dist\MarkItDownGUI.exe"
