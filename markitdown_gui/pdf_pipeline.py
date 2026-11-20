@@ -102,6 +102,76 @@ def _merge_bilingual_captions(caps: list[dict]) -> list[dict]:
     return out
 
 
+def _page_lines(page) -> list[tuple[pymupdf.Rect, str]]:
+    out = []
+    for b in page.get_text('dict')['blocks']:
+        if b.get('type') != 0:
+            continue
+        for ln in b['lines']:
+            t = ''.join(s['text'] for s in ln['spans']).strip()
+            if t:
+                out.append((pymupdf.Rect(ln['bbox']), t))
+    return out
+
+
+def _ink_below(page, box: pymupdf.Rect, y: float) -> bool:
+    """box 안, y 아래쪽에 선(벡터)이나 이미지가 있는가. 그림 전체를 두르는 테두리는 제외."""
+    below = pymupdf.Rect(box.x0, y + 1, box.x1, box.y1)
+    if below.is_empty:
+        return False
+    for d in page.get_drawings():
+        r = d['rect']
+        # 가로선·세로선은 높이·폭이 0인 사각형이라 intersects()가 False → 좌표로 직접 비교
+        hits = r.x0 <= below.x1 and r.x1 >= below.x0 and r.y0 <= below.y1 and r.y1 >= below.y0
+        if hits and not (r.y0 <= box.y0 + 2 and r.y1 >= box.y1 - 2):
+            return True
+    return any(r.intersects(below) for x in page.get_images(full=True) for r in page.get_image_rects(x[0]))
+
+
+def _split_merged_captions(page, caps: list[dict], pool: list[dict]) -> None:
+    """레이아웃 엔진이 캡션 줄을 그림·표 상자에 합친 경우 분리한다(그 라벨의 캡션이 따로 없을 때만).
+    - 그림 상자: 캡션 줄 아래쪽에 선·이미지가 없을 때만 그 줄을 경계로 그림 | 캡션으로 나눔
+    - 표 상자: 위쪽 표와 다른 표의 캡션 줄이 나오면 그 줄을 경계로 두 표로 나눔"""
+    known = {c['label'] for c in caps}
+    lines = None
+    for v in list(pool):
+        if v.get('formula') or v['cls'] not in ('picture', 'table'):
+            continue
+        box = v['rect']
+        if lines is None:
+            lines = _page_lines(page)
+        inside = [(lr, t) for lr, t in lines
+                  if box.contains(pymupdf.Point((lr.x0 + lr.x1) / 2, (lr.y0 + lr.y1) / 2))]
+        inside.sort(key=lambda lt: lt[0].y0)
+        for i, (lr, t) in enumerate(inside):
+            lab = label_of(t)
+            if not lab or lab in known or lr.y0 - box.y0 < 10:   # 상자 맨 위 줄은 그 상자 자신의 캡션일 수 있음
+                continue
+            if v['cls'] == 'picture' and lab.startswith('Fig'):
+                if _ink_below(page, box, lr.y1):
+                    continue
+                cap_lines = inside[i:]
+                v['rect'] = pymupdf.Rect(box.x0, box.y0, box.x1, lr.y0 - 0.5)
+            elif v['cls'] == 'table' and lab.startswith('Table'):
+                cap_lines = [inside[i]]
+                for nr, nt in inside[i + 1:]:       # 'Tab. 6 …' 같은 영문 줄이 바로 아래 붙어 있으면 함께
+                    prev = cap_lines[-1][0]
+                    if 0 < nr.y0 - prev.y0 <= 1.8 * prev.height and re.match(r'^\s*(Tab\.?|Table|TABLE)\s*\d', nt):
+                        cap_lines.append((nr, nt))
+                    else:
+                        break
+                cap_bottom = max(r.y1 for r, _ in cap_lines)
+                v['rect'] = pymupdf.Rect(box.x0, box.y0, box.x1, lr.y0 - 0.5)
+                v['mixed_with'] = lab
+                pool.append(dict(rect=pymupdf.Rect(box.x0, cap_bottom + 0.5, box.x1, box.y1), cls='table', used=False))
+            else:
+                continue
+            caps.append(dict(label=lab, rect=_union(r for r, _ in cap_lines),
+                             text=' '.join(t2 for _, t2 in cap_lines), split=True))
+            known.add(lab)
+            break
+
+
 # --------------------------------------------------------------------------------------
 # 2. 영역 찾기
 # --------------------------------------------------------------------------------------
@@ -133,6 +203,7 @@ def find_regions(doc: pymupdf.Document, layout: dict, formula_images: str = 'gar
                 texts.append(r)
 
         caps = _merge_bilingual_captions(caps)
+        _split_merged_captions(page, caps, pool)
 
         # 표 캡션은 'Table 2' 줄 + 바로 아래 제목 줄로 나뉘는 경우가 많다(Elsevier/IEEE) → 합친다
         for c in caps:
@@ -208,7 +279,8 @@ def find_regions(doc: pymupdf.Document, layout: dict, formula_images: str = 'gar
                 if kind == 'table' and r.width < 0.6 * (x1 - x0):      # 표가 한 열만 잡힌 경우 단 폭으로 확장
                     r = pymupdf.Rect(min(r.x0, x0), r.y0, max(r.x1, x1), r.y1)
                 out.append(dict(page=pg['page_number'], label=c['label'], rect=r, how='layout',
-                                caption=c['text'], kind=kind))
+                                caption=c['text'], kind=kind, caption_split=c.get('split', False),
+                                mixed_with=next((v['mixed_with'] for v in got if v.get('mixed_with')), None)))
                 continue
             if kind == 'figure':
                 lim = max([t.y1 for t in texts if t.height > 22 and t.y1 < cr.y0 - 2 and _hov(t, col) > 20] + [40])
@@ -326,6 +398,45 @@ def _caption_anchor(md: str, label: str) -> int | None:
     return m.start() if m else None
 
 
+def _squeeze(s: str) -> str:
+    return re.sub(r'\s+', '', unicodedata.normalize('NFKC', s or ''))
+
+
+def _restore_split_captions(md: str, items) -> str:
+    """그림 상자에서 분리한 캡션은 '그림 안 글자' 블록과 함께 지워지므로, 그 블록 자리에 캡션 문장을 넣는다."""
+    for it in items:
+        key = _squeeze(it.caption)[:10]
+        if not key or key in _squeeze(PICTURE_TEXT.sub('', md)):
+            continue
+        for m in PICTURE_TEXT.finditer(md):
+            if key in _squeeze(m.group(0)):
+                md = md[:m.start()] + f'\n{it.caption}\n\n' + md[m.end():]
+                break
+        else:
+            md = md.rstrip() + f'\n\n{it.caption}\n'
+    return md
+
+
+def _mark_mixed_table(md: str, it) -> str:
+    """표 상자에 다른 표가 섞였을 때, MD 텍스트 표에도 그 표의 캡션 행이 있으면 표 앞에 알림을 넣는다."""
+    pos = _caption_anchor(md, it.label)
+    if pos is None:
+        return md
+    m = re.search(r'^\|', md[pos:], re.M)
+    if m is None:
+        return md
+    start = pos + m.start()
+    end = md.find('\n\n', start)
+    table = md[start:end if end >= 0 else len(md)]
+    for row in table.splitlines():
+        cells = ' '.join(c.strip() for c in row.strip().strip('|').split('|') if c.strip())
+        if label_of(cells) == it.mixed_with:
+            num = it.mixed_with.split(' ', 1)[1]
+            name = f'表{num}' if cells.lstrip().startswith('表') else it.mixed_with
+            return md[:start] + f'※ 표 텍스트에 {name} 내용이 섞여 있음, 이미지 모음 PDF 참조\n\n' + md[start:]
+    return md
+
+
 # --------------------------------------------------------------------------------------
 # 5. 변환 본체
 # --------------------------------------------------------------------------------------
@@ -362,6 +473,8 @@ class FigureItem:
     file_name: str
     jpg: bytes = field(repr=False)
     px: tuple = (0, 0)
+    caption_split: bool = False     # 캡션 줄을 그림·표 상자에서 분리했음
+    mixed_with: str | None = None   # 이 표 상자에 다른 표(라벨)가 섞여 있었음
 
 
 def convert_pdf(pdf_path, out_dir, *, dpi: int = 150, jpg_quality: int = 80, pad: float = 3.0,
@@ -412,6 +525,7 @@ def convert_pdf(pdf_path, out_dir, *, dpi: int = 150, jpg_quality: int = 80, pad
         idx = len(items) + 1
         items.append(FigureItem(index=idx, label=r['label'], kind=r['kind'], page=r['page'], how=r['how'],
                                 caption=(r['caption'] or '').strip(),
+                                caption_split=r.get('caption_split', False), mixed_with=r.get('mixed_with'),
                                 file_name=f'{short}_p{r["page"]:03d}_{idx:02d}_{tag}.jpg',
                                 jpg=pix.tobytes('jpg', jpg_quality=jpg_quality), px=(pix.width, pix.height)))
         if progress:
@@ -433,10 +547,15 @@ def convert_pdf(pdf_path, out_dir, *, dpi: int = 150, jpg_quality: int = 80, pad
     parts = ['---\n' + '\n'.join(f'{k}: {json.dumps(v, ensure_ascii=False)}' for k, v in front.items()) + '\n---\n']
     for n, ch in enumerate(chunks, start=1):
         md = ch['text'] if isinstance(ch, dict) else str(ch)
+        page_items = by_page.get(n, [])
         if strip_ok:
+            md = _restore_split_captions(md, [it for it in page_items if it.caption_split and it.kind == 'figure'])
             md = PICTURE_TEXT.sub('', md)
         md = tidy_md(md)
-        for it in by_page.get(n, []):
+        for it in page_items:
+            if it.mixed_with:
+                md = _mark_mixed_table(md, it)
+        for it in page_items:
             link = f'![{it.label or "Image"}](images/{it.file_name})\n\n'
             pos = _caption_anchor(md, it.label) if it.label and it.kind in ('figure', 'table') else None
             md = (md[:pos] + link + md[pos:]) if pos is not None else (md.rstrip() + '\n\n' + link)
