@@ -65,7 +65,7 @@ python -m venv .venv
 .\.venv\Scripts\pip install -r requirements.txt
 .\.venv\Scripts\python.exe main.py
 ```
-또는 `.venv`가 이미 있다면 `run.bat`을 더블클릭해서 실행합니다.
+또는 `.venv`가 이미 있다면 `run_gui.bat`(콘솔 창 없음) 또는 `run.bat`(콘솔 출력 보기)을 더블클릭해서 실행합니다.
 
 ### 2) 배포용 단일 실행 파일(.exe) 빌드 (권장)
 Python 설치 없이 다른 PC에서도 바로 실행할 수 있도록 PyInstaller로 패키징합니다.
