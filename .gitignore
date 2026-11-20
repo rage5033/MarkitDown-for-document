@@ -15,3 +15,5 @@ tests/out_*/
 tests/t5_gui/
 tests/fixtures/
 tests/t7_*/
+tests/t[0-9]*/
+tests/t[0-9]*_*/
