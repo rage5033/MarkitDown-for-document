@@ -153,13 +153,14 @@ def _split_merged_captions(page, caps: list[dict], pool: list[dict]) -> None:
                 cap_lines = inside[i:]
                 v['rect'] = pymupdf.Rect(box.x0, box.y0, box.x1, lr.y0 - 0.5)
             elif v['cls'] == 'table' and lab.startswith('Table'):
-                cap_lines = [inside[i]]
-                for nr, nt in inside[i + 1:]:       # 'Tab. 6 …' 같은 영문 줄이 바로 아래 붙어 있으면 함께
-                    prev = cap_lines[-1][0]
-                    if 0 < nr.y0 - prev.y0 <= 1.8 * prev.height and re.match(r'^\s*(Tab\.?|Table|TABLE)\s*\d', nt):
-                        cap_lines.append((nr, nt))
-                    else:
-                        break
+                # 같은 높이로 쪼개진 줄('表6' '系统并网' '试验结果')과 바로 아래 영문 'Tab. 6 …' 줄을 함께 캡션으로
+                same_row = lambda r0, r1: min(r0.y1, r1.y1) - max(r0.y0, r1.y0) > 0.5 * min(r0.height, r1.height)
+                cap_lines = sorted([(r2, t2) for r2, t2 in inside if same_row(r2, lr)], key=lambda x: x[0].x0)
+                rest = [x for x in inside if x not in cap_lines and x[0].y0 > lr.y0]
+                en = next((x for x in rest if re.match(r'^\s*(Tab\.?|Table|TABLE)\s*\d', x[1])
+                           and 0 < x[0].y0 - lr.y0 <= 1.8 * lr.height), None)
+                if en is not None:
+                    cap_lines += sorted([x for x in rest if same_row(x[0], en[0])], key=lambda x: x[0].x0)
                 cap_bottom = max(r.y1 for r, _ in cap_lines)
                 v['rect'] = pymupdf.Rect(box.x0, box.y0, box.x1, lr.y0 - 0.5)
                 v['mixed_with'] = lab
