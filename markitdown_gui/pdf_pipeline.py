@@ -34,6 +34,9 @@ import pymupdf4llm
 # --------------------------------------------------------------------------------------
 FIG_RE = re.compile(r'^\s*(Fig\.?|FIG\.?|Figure|FIGURE)\s*((?:[A-Z]\.\s?)?\d+)\s*[\.:]')
 TAB_RE = re.compile(r'^\s*(TABLE|Table)\s+((?:[A-Z]\.\s?)?\d+|[IVX]+)(?=\s*[\.:]|\s*$|\s+[A-Z][A-Z\s]{3,})')
+# 중국어 캡션(NFKC 후): 图/圖/表 + 번호(1, 3-2, 3.2) 바로 뒤에 공백·마침표·쌍점·줄 끝.
+# '如图1所示'처럼 번호 뒤에 한자가 붙는 본문 인용과 문장 중간의 인용은 제외된다.
+ZH_CAP_RE = re.compile(r'^\s*(图|圖|表)\s*(\d+(?:[.\-]\d+)*)(?=[\s.:]|$)')
 CAPTION_CLASSES = ('caption', 'text', 'list-item', 'picture', 'section-header')
 SIDE_GAP = 35          # pt, 옆으로 붙은 부분그림/분할된 표를 합칠 때 허용 간격
 # 깨진 수식 징후: (cid:N), '='→'¼' 같은 폰트 인코딩 오류, 사용자정의영역 문자, 대체문자(�)
@@ -49,6 +52,9 @@ def label_of(text: str) -> str | None:
     m = TAB_RE.match(t)
     if m:
         return 'Table ' + m.group(2).replace(' ', '')
+    m = ZH_CAP_RE.match(unicodedata.normalize('NFKC', t))   # 영문 규칙이 먼저라 영문 논문 결과는 그대로
+    if m:
+        return ('Table ' if m.group(1) == '表' else 'Fig ') + m.group(2)
     return None
 
 
@@ -72,6 +78,28 @@ def _union(rects) -> pymupdf.Rect:
     for r in rects[1:]:
         u |= r
     return u
+
+
+def _is_zh_caption(text: str) -> bool:
+    return bool(ZH_CAP_RE.match(unicodedata.normalize('NFKC', (text or '').strip())))
+
+
+def _merge_bilingual_captions(caps: list[dict]) -> list[dict]:
+    """중국어 논문의 '图1 …' + 바로 붙은 'Fig. 1 …'(같은 번호)은 캡션 하나로 합쳐 그림을 한 번만 만든다.
+    둘 중 하나가 중국어 캡션일 때만 합치므로 영문 논문에는 영향이 없다."""
+    out: list[dict] = []
+    for c in caps:
+        prev = next((p for p in out if p['label'] == c['label']
+                     and (_is_zh_caption(p['text']) or _is_zh_caption(c['text']))
+                     and _hov(p['rect'], c['rect']) > 0
+                     and -2 <= max(c['rect'].y0 - p['rect'].y1, p['rect'].y0 - c['rect'].y1) <= 15), None)
+        if prev is not None:
+            first, second = (prev, c) if prev['rect'].y0 <= c['rect'].y0 else (c, prev)
+            prev['text'] = first['text'].rstrip() + ' ' + second['text'].strip()
+            prev['rect'] = prev['rect'] | c['rect']
+            continue
+        out.append(c)
+    return out
 
 
 # --------------------------------------------------------------------------------------
@@ -103,6 +131,8 @@ def find_regions(doc: pymupdf.Document, layout: dict, formula_images: str = 'gar
                 formulas.append(dict(rect=r, text=t))
             elif cls in ('text', 'list-item', 'section-header', 'title'):
                 texts.append(r)
+
+        caps = _merge_bilingual_captions(caps)
 
         # 표 캡션은 'Table 2' 줄 + 바로 아래 제목 줄로 나뉘는 경우가 많다(Elsevier/IEEE) → 합친다
         for c in caps:
@@ -287,6 +317,12 @@ def _caption_anchor(md: str, label: str) -> int | None:
     else:
         return None
     m = re.search(pat, md, re.M)
+    if m is None:
+        # 중국어 캡션: 전각 숫자·구두점도 허용 (MD 원문은 NFKC 전 상태)
+        digits = ''.join(f'[{ch}{chr(ord(ch) + 0xFEE0)}]' if ch.isdigit() else f'[{re.escape(ch)}．－]'
+                         for ch in num)
+        word = '表' if kind == 'Table' else '[图圖]'
+        m = re.search(rf'^[ \t>*_#]*{word}\s*{digits}(?=[\s\u3000.:：．]|$)', md, re.M)
     return m.start() if m else None
 
 
@@ -371,7 +407,8 @@ def convert_pdf(pdf_path, out_dir, *, dpi: int = 150, jpg_quality: int = 80, pad
                 continue
         clip = (r['rect'] + (-pad, -pad, pad, pad)) & page.rect
         pix = page.get_pixmap(clip=clip, dpi=dpi)
-        tag = re.sub(r'[^0-9A-Za-z]+', '', r['label'] or 'Image')
+        # 번호 사이 구분자는 남긴다: 'Fig 3-2' → Fig3-2 (Fig32와 구분), 'Fig A.1' → FigA.1
+        tag = re.sub(r'[^0-9A-Za-z.\-]+', '', r['label'] or 'Image')
         idx = len(items) + 1
         items.append(FigureItem(index=idx, label=r['label'], kind=r['kind'], page=r['page'], how=r['how'],
                                 caption=(r['caption'] or '').strip(),

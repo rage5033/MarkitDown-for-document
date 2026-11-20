@@ -8,7 +8,7 @@ verify_conversion.py — 원본 PDF ↔ (MD + 이미지 모음 PDF) 정합성 �
   python verify_conversion.py --orig-dir ./원본 --out-dir ./출력 [--json report.json]
   종료 코드: 모두 합격 0, 하나라도 불합격 1
 
-측정 기준이 되는 원문 '본문 블록' = 2줄 이상이고 줄 평균 40자 이상인 텍스트 블록
+측정 기준이 되는 원문 '본문 블록' = 2줄 이상이고 줄 평균 40자 이상인 텍스트 블록 (한자가 절반 넘는 줄은 20자 기준)
 (그림 안 눈금·범례 글자, 머리글·바닥글은 제외됨)
 
 합격 조건 (하나라도 어기면 FAIL)
@@ -37,6 +37,11 @@ import pymupdf
 
 FIG_RE = re.compile(r'^\s*(Fig\.?|FIG\.?|Figure|FIGURE)\s*((?:[A-Z]\.\s?)?\d+)\s*[\.:]')
 TAB_RE = re.compile(r'^\s*(TABLE|Table)\s+((?:[A-Z]\.\s?)?\d+|[IVX]+)(?=\s*[\.:]|\s*$|\s+[A-Z][A-Z\s]{3,})')
+# 중국어 캡션(NFKC 후): 图/圖/表 + 번호(1, 3-2, 3.2) 바로 뒤에 공백·마침표·쌍점·줄 끝 ('如图1所示' 제외)
+ZH_CAP_RE = re.compile(r'^\s*(图|圖|表)\s*(\d+(?:[.\-]\d+)*)(?=[\s.:]|$)')
+HAN = re.compile(r'[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]')
+BODY_LINE_AVG = 40      # 본문 블록: 줄 평균 글자 수 기준 (영문 줄)
+BODY_LINE_AVG_HAN = 20  # 한자가 절반 넘는 줄의 기준
 GARBLED = re.compile(r'\(cid:\d+\)|¼|[-�]')
 
 THRESHOLDS = dict(coverage=0.97, order=0.80, glued_max=0.01)
@@ -50,7 +55,22 @@ def label_of(text: str) -> str | None:
     m = TAB_RE.match(t)
     if m:
         return 'Table ' + m.group(2).replace(' ', '')
+    m = ZH_CAP_RE.match(unicodedata.normalize('NFKC', t))
+    if m:
+        return ('Table ' if m.group(1) == '表' else 'Fig ') + m.group(2)
     return None
+
+
+def _line_threshold(line: str) -> int:
+    chars = re.sub(r'\s+', '', line)
+    return BODY_LINE_AVG_HAN if chars and len(HAN.findall(chars)) * 2 > len(chars) else BODY_LINE_AVG
+
+
+def is_body_block(lines: list[str]) -> bool:
+    """2줄 이상, 줄 평균 글자 수가 줄별 기준(영문 40, 한자가 절반 넘는 줄 20)의 평균 이상."""
+    if len(lines) < 2:
+        return False
+    return sum(len(x) for x in lines) / len(lines) >= sum(_line_threshold(x) for x in lines) / len(lines)
 
 
 def clean(s: str) -> str:
@@ -83,7 +103,7 @@ def read_original(path: Path) -> dict:
                         break
             if lab and lab not in captions:
                 captions[lab] = p.number + 1
-            if len(lines) >= 2 and sum(len(x) for x in lines) / len(lines) >= 40:
+            if is_body_block(lines):
                 blocks.append(lines)
     return dict(pages=doc.page_count, blocks=blocks, captions=captions, bytes=path.stat().st_size)
 

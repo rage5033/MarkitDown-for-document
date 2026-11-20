@@ -13,3 +13,5 @@ Claude/
 tests/fixtures/scan/
 tests/out_*/
 tests/t5_gui/
+tests/fixtures/
+tests/t7_*/
