@@ -477,15 +477,16 @@ def _caption_anchor(md: str, label: str) -> int | None:
         pat = rf'^[ \t>*_#]*(?:TABLE|Table)\s+{num_re}\b'
     else:
         return None
-    m = re.search(pat, md, re.M)
-    if m is None:
-        # 중국어 캡션: 전각 숫자·구두점도 허용 (MD 원문은 NFKC 전 상태)
-        digits = ''.join(f'[{ch}{chr(ord(ch) + 0xFEE0)}]' if ch.isdigit() else f'[{re.escape(ch)}．－]'
-                         for ch in num)
-        word = '表' if kind == 'Table' else '[图圖]'
-        # pymupdf4llm은 번호만 굵게 쓰기도 한다: '图 **1** 大规模…'
-        m = re.search(rf'^[ \t>*_#]*{word}\s*\**\s*{digits}\**(?=[\s\u3000.:：．]|$)', md, re.M)
-    return m.start() if m else None
+    m_en = re.search(pat, md, re.M)
+    # 중국어 캡션: 전각 숫자·구두점도 허용 (MD 원문은 NFKC 전 상태)
+    digits = ''.join(f'[{ch}{chr(ord(ch) + 0xFEE0)}]' if ch.isdigit() else f'[{re.escape(ch)}．－]'
+                     for ch in num)
+    word = '表' if kind == 'Table' else '[图圖]'
+    # pymupdf4llm은 번호만 굵게 쓰기도 한다: '图 **1** 大规模…'
+    m_zh = re.search(rf'^[ \t>*_#]*{word}\s*\**\s*{digits}\**(?=[\s\u3000.:：．]|$)', md, re.M)
+    # 중국어 캡션 아래에 영문 캡션이 붙은 경우 링크가 두 줄 사이에 끼지 않게 먼저 나오는 줄 앞에 넣는다
+    found = [m.start() for m in (m_en, m_zh) if m]
+    return min(found) if found else None
 
 
 def _squeeze(s: str) -> str:

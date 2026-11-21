@@ -136,6 +136,10 @@ class CjkSpacing(unittest.TestCase):
         md = "正文 (图1)。\n\n图 **1** 大规模储能技术分类 \n\n**Fig. 1 Large-scale**\n"
         self.assertEqual(md[P._caption_anchor(md, "Fig 1"):].split("\n")[0], "图 **1** 大规模储能技术分类 ")
 
+    def test_link_anchor_before_chinese_line_when_english_caption_follows(self):
+        md = "正文。\n\n#### 表 **2** 电化学储能系统参数 \n\n#### **Table 2 Parameters of system** \n\n|a|b|\n"
+        self.assertTrue(md[P._caption_anchor(md, "Table 2"):].startswith("#### 表 **2**"))
+
     def test_removes_spaces_between_cjk_digits_and_before_closing_punct(self):
         cases = {
             "上游锂矿石原料 价格急剧波动": "上游锂矿石原料价格急剧波动",
