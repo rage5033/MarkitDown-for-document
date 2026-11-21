@@ -45,11 +45,12 @@ class BilingualMerge(unittest.TestCase):
 
 class SplitMergedCaptions(unittest.TestCase):
     @staticmethod
-    def page_with(draw_below: bool):
+    def page_with(draw_below: bool, draw_above: bool = True):
         doc = pymupdf.open()
         page = doc.new_page(width=600, height=800)
         page.insert_font(fontname="cjk", fontbuffer=pymupdf.Font("cjk").buffer)
-        page.draw_rect(pymupdf.Rect(100, 100, 300, 250), color=(0, 0, 0))          # 그림(벡터)
+        if draw_above:
+            page.draw_rect(pymupdf.Rect(100, 100, 300, 250), color=(0, 0, 0))      # 그림(벡터)
         page.insert_text((110, 270), "图 1 系统结构", fontname="cjk", fontsize=9)
         page.insert_text((110, 282), "Fig. 1 System structure", fontsize=9)
         if draw_below:
@@ -65,8 +66,24 @@ class SplitMergedCaptions(unittest.TestCase):
         self.assertIn("System structure", caps[0]["text"])
         self.assertLess(pool[0]["rect"].y1, 262)
 
-    def test_no_split_when_lines_below_caption(self):
-        doc, page = self.page_with(draw_below=True)
+    def test_two_figures_in_one_box_split_at_caption_between(self):
+        doc = pymupdf.open()
+        page = doc.new_page(width=600, height=800)
+        page.insert_font(fontname="cjk", fontbuffer=pymupdf.Font("cjk").buffer)
+        page.draw_rect(pymupdf.Rect(100, 100, 300, 250), color=(0, 0, 0))     # 위 그림
+        page.insert_text((110, 270), "图 3 阻抗", fontname="cjk", fontsize=9)
+        page.draw_rect(pymupdf.Rect(100, 300, 300, 450), color=(0, 0, 0))     # 아래 그림
+        caps = [dict(label="Fig 4", text="图 4 界面", rect=pymupdf.Rect(110, 470, 300, 480))]
+        pool = [dict(rect=pymupdf.Rect(95, 95, 305, 460), cls="picture", used=False)]
+        P._split_merged_captions(page, caps, pool)
+        self.assertEqual([c["label"] for c in caps], ["Fig 4", "Fig 3"])
+        self.assertEqual(len(pool), 2)
+        self.assertLess(pool[0]["rect"].y1, 262)
+        self.assertGreater(pool[1]["rect"].y0, 272)
+        self.assertLess(pool[1]["rect"].y0, 300)
+
+    def test_no_split_when_ink_only_below_caption(self):
+        doc, page = self.page_with(draw_below=True, draw_above=False)
         caps, pool = [], [dict(rect=pymupdf.Rect(95, 95, 305, 300), cls="picture", used=False)]
         P._split_merged_captions(page, caps, pool)
         self.assertEqual(caps, [])

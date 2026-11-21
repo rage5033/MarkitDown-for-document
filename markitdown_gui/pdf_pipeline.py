@@ -114,27 +114,56 @@ def _page_lines(page) -> list[tuple[pymupdf.Rect, str]]:
     return out
 
 
-def _ink_below(page, box: pymupdf.Rect, y: float) -> bool:
+def _ink_rects(page, region: pymupdf.Rect, box: pymupdf.Rect, cache: dict) -> list[pymupdf.Rect]:
+    """region과 겹치는 선(벡터)·이미지 사각형. 상자 전체를 두르는 테두리는 제외. 쪽당 1회만 읽는다."""
+    if 'ink' not in cache:
+        cache['ink'] = [d['rect'] for d in page.get_drawings()]
+        cache['ink'] += [r for x in page.get_images(full=True) for r in page.get_image_rects(x[0])]
+    out = []
+    for r in cache['ink']:
+        # 가로선·세로선은 높이·폭이 0인 사각형이라 intersects()가 False → 좌표로 직접 비교
+        hits = r.x0 <= region.x1 and r.x1 >= region.x0 and r.y0 <= region.y1 and r.y1 >= region.y0
+        if hits and not (r.y0 <= box.y0 + 2 and r.y1 >= box.y1 - 2):
+            out.append(r)
+    return out
+
+
+def _ink_below(page, box: pymupdf.Rect, y: float, cache: dict | None = None) -> bool:
     """box 안, y 아래쪽에 선(벡터)이나 이미지가 있는가. 그림 전체를 두르는 테두리는 제외."""
     below = pymupdf.Rect(box.x0, y + 1, box.x1, box.y1)
     if below.is_empty:
         return False
-    for d in page.get_drawings():
-        r = d['rect']
-        # 가로선·세로선은 높이·폭이 0인 사각형이라 intersects()가 False → 좌표로 직접 비교
-        hits = r.x0 <= below.x1 and r.x1 >= below.x0 and r.y0 <= below.y1 and r.y1 >= below.y0
-        if hits and not (r.y0 <= box.y0 + 2 and r.y1 >= box.y1 - 2):
-            return True
-    return any(r.intersects(below) for x in page.get_images(full=True) for r in page.get_image_rects(x[0]))
+    return bool(_ink_rects(page, below, box, {} if cache is None else cache))
+
+
+def _caption_block(inside: list, i: int, stop_y: float) -> list:
+    """i번째 캡션 줄부터 이어지는 캡션 줄들(같은 단, 줄 간격 ≤ 줄 높이, stop_y 위)."""
+    lr = inside[i][0]
+    block = [inside[i]]
+    for r, t in inside[i + 1:]:
+        cx = (r.x0 + r.x1) / 2
+        if r.y1 > stop_y + 1 or not (lr.x0 - 50 <= cx <= lr.x1 + 50):
+            continue
+        prev = block[-1][0]
+        if r.y0 - prev.y1 > max(prev.height, 6):
+            break
+        block.append((r, t))
+    return block
 
 
 def _split_merged_captions(page, caps: list[dict], pool: list[dict]) -> None:
     """레이아웃 엔진이 캡션 줄을 그림·표 상자에 합친 경우 분리한다(그 라벨의 캡션이 따로 없을 때만).
-    - 그림 상자: 캡션 줄 아래쪽에 선·이미지가 없을 때만 그 줄을 경계로 그림 | 캡션으로 나눔
+    - 그림 상자, 캡션 줄 아래에 선·이미지 없음: 그 줄을 경계로 그림 | 캡션
+    - 그림 상자, 캡션 줄 위·아래 모두 선·이미지 있음(그림 두 개가 한 상자): 위쪽은 이 캡션의 그림,
+      캡션 아래쪽은 새 그림 상자로 떼어 다음 캡션이 가져가게 함 (떼어 낸 상자도 다시 검사)
     - 표 상자: 위쪽 표와 다른 표의 캡션 줄이 나오면 그 줄을 경계로 두 표로 나눔"""
     known = {c['label'] for c in caps}
     lines = None
-    for v in list(pool):
+    cache: dict = {}
+    k = 0
+    while k < len(pool):
+        v = pool[k]
+        k += 1
         if v.get('formula') or v['cls'] not in ('picture', 'table'):
             continue
         box = v['rect']
@@ -148,10 +177,22 @@ def _split_merged_captions(page, caps: list[dict], pool: list[dict]) -> None:
             if not lab or lab in known or lr.y0 - box.y0 < 10:   # 상자 맨 위 줄은 그 상자 자신의 캡션일 수 있음
                 continue
             if v['cls'] == 'picture' and lab.startswith('Fig'):
-                if _ink_below(page, box, lr.y1):
-                    continue
-                cap_lines = inside[i:]
-                v['rect'] = pymupdf.Rect(box.x0, box.y0, box.x1, lr.y0 - 0.5)
+                below = [r for r in _ink_rects(page, pymupdf.Rect(box.x0, lr.y1 + 1, box.x1, box.y1), box, cache)
+                         if r.y0 >= lr.y1 - 1]
+                if not below:
+                    cap_lines = inside[i:]
+                    v['rect'] = pymupdf.Rect(box.x0, box.y0, box.x1, lr.y0 - 0.5)
+                else:
+                    above = _ink_rects(page, pymupdf.Rect(box.x0, box.y0, box.x1, lr.y0 - 1), box, cache)
+                    if not above:
+                        continue
+                    cap_lines = _caption_block(inside, i, min(r.y0 for r in below))
+                    cap_bottom = max(r.y1 for r, _ in cap_lines)
+                    lower = pymupdf.Rect(box.x0, cap_bottom + 0.5, box.x1, box.y1)
+                    if not _ink_rects(page, lower, box, cache):
+                        continue
+                    v['rect'] = pymupdf.Rect(box.x0, box.y0, box.x1, lr.y0 - 0.5)
+                    pool.append(dict(rect=lower, cls='picture', used=False))
             elif v['cls'] == 'table' and lab.startswith('Table'):
                 # 같은 높이로 쪼개진 줄('表6' '系统并网' '试验结果')과 바로 아래 영문 'Tab. 6 …' 줄을 함께 캡션으로
                 same_row = lambda r0, r1: min(r0.y1, r1.y1) - max(r0.y0, r1.y0) > 0.5 * min(r0.height, r1.height)
