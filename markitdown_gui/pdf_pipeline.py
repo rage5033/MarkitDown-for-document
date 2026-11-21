@@ -84,6 +84,15 @@ def _is_zh_caption(text: str) -> bool:
     return bool(ZH_CAP_RE.match(unicodedata.normalize('NFKC', (text or '').strip())))
 
 
+_HAN_CHAR = re.compile(r'[\u3400-\u4dbf\u4e00-\u9fff]')
+
+
+def _body_sentence(text: str) -> bool:
+    """본문 문장으로 보이는가: '。'가 있거나, '，'가 있고 한자가 50자를 넘음."""
+    t = text or ''
+    return '。' in t or ('，' in t and len(_HAN_CHAR.findall(t)) > 50)
+
+
 def _merge_bilingual_captions(caps: list[dict]) -> list[dict]:
     """중국어 논문의 '图1 …' + 바로 붙은 'Fig. 1 …'(같은 번호)은 캡션 하나로 합쳐 그림을 한 번만 만든다.
     둘 중 하나가 중국어 캡션일 때만 합치므로 영문 논문에는 영향이 없다."""
@@ -232,6 +241,8 @@ def find_regions(doc: pymupdf.Document, layout: dict, formula_images: str = 'gar
         for b in pg['boxes']:
             cls, t, r = b['boxclass'], _box_text(b), _rect(b)
             lab = label_of(t) if cls in CAPTION_CLASSES and len(t) < 1500 else None
+            if lab and cls != 'caption' and _body_sentence(t):   # '图 10 对比了…。' 같은 본문 문장
+                lab = None
             if lab and not (cls == 'picture' and r.height > 30):
                 caps.append(dict(label=lab, rect=r, text=t))
             elif cls in ('picture', 'table'):
@@ -268,10 +279,13 @@ def find_regions(doc: pymupdf.Document, layout: dict, formula_images: str = 'gar
             return False
 
         # (1) 시각 요소 → 가장 가까운 캡션 (그림: 캡션이 아래, 표: 캡션이 위)
-        assigned = {i: [] for i in range(len(caps))}
-        for v in pool:
+        #     표 상자는 조건에 맞는 표 캡션이 있으면 거리와 상관없이 표 캡션에 먼저 배정하고,
+        #     그림 캡션은 표 캡션이 없는 표 상자만 가져갈 수 있다.
+        def nearest(v, want):
             vr, best, bestd = v['rect'], None, 1e9
             for i, c in enumerate(caps):
+                if not want(c):
+                    continue
                 cr = c['rect']
                 if _hov(cr, vr) < 0.3 * min(cr.width, vr.width):
                     continue
@@ -287,6 +301,15 @@ def find_regions(doc: pymupdf.Document, layout: dict, formula_images: str = 'gar
                         continue
                 if -15 <= d < bestd:
                     best, bestd = i, d
+            return best
+
+        assigned = {i: [] for i in range(len(caps))}
+        for v in pool:
+            best = None
+            if v['cls'] == 'table':
+                best = nearest(v, lambda c: c['label'].startswith('Table'))
+            if best is None:
+                best = nearest(v, lambda c: True)
             if best is not None:
                 assigned[best].append(v)
                 v['used'] = True

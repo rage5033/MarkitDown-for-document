@@ -160,6 +160,28 @@ class CjkSpacing(unittest.TestCase):
                 self.assertEqual(P.cjk_spacing(s), s)
 
 
+class BodySentenceAndTablePriority(unittest.TestCase):
+    def test_body_sentence_rule(self):
+        self.assertTrue(P._body_sentence("图 10 对比了恒定流量与多阶段变流量策略下的电池模块温度演变情况。"))
+        self.assertTrue(P._body_sentence("图 3 " + "钠" * 51 + "，" + "钠"))
+        self.assertFalse(P._body_sentence("图 3 风冷式钠离子电池簇充放电过程中电压与温度一致性"))
+        self.assertFalse(P._body_sentence("图 2 结构，对比"))
+        self.assertFalse(P._body_sentence("Fig. 3. Topology of the converter."))
+
+    def test_table_box_goes_to_table_caption_before_nearer_figure_caption(self):
+        doc = pymupdf.open()
+        page = doc.new_page(width=600, height=800)
+        boxes = [
+            dict(boxclass="caption", x0=100, y0=100, x1=300, y1=110, textlines=None, text="Table 3. Flow rate"),
+            dict(boxclass="table", x0=100, y0=130, x1=300, y1=200, textlines=None, text=""),
+            dict(boxclass="caption", x0=100, y0=205, x1=300, y1=215, textlines=None, text="Fig. 10. Temperature"),
+        ]
+        layout = dict(pages=[dict(page_number=1, width=600, height=800, boxes=boxes)])
+        regions = {r["label"]: r for r in P.find_regions(doc, layout)}
+        self.assertEqual(regions["Table 3"]["how"], "layout")
+        self.assertNotEqual(regions["Fig 10"]["how"], "layout")
+
+
 class CjkBodyBlocks(unittest.TestCase):
     def test_han_lines_use_20_chars_and_english_lines_keep_40(self):
         self.assertTrue(V.is_body_block(["钠离子电池作为一种新型的电化学储能技术具有", "资源丰富安全性高高低温性能优异高倍率充放"]))
