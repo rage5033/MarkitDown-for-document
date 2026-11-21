@@ -198,7 +198,12 @@ def _split_merged_captions(page, caps: list[dict], pool: list[dict]) -> None:
                     cap_lines = _caption_block(inside, i, min(r.y0 for r in below))
                     cap_bottom = max(r.y1 for r, _ in cap_lines)
                     lower = pymupdf.Rect(box.x0, cap_bottom + 0.5, box.x1, box.y1)
-                    if not _ink_rects(page, lower, box, cache):
+                    # 떼어 낸 아래 조각이 다음 캡션과 겹치면 그 캡션 위에서 끊는다(겹치면 배정되지 않음)
+                    nxt = [c['rect'].y0 for c in caps if cap_bottom < c['rect'].y0 < lower.y1
+                           and _hov(c['rect'], lower) > 0]
+                    if nxt:
+                        lower.y1 = min(nxt) - 0.5
+                    if lower.is_empty or not _ink_rects(page, lower, box, cache):
                         continue
                     v['rect'] = pymupdf.Rect(box.x0, box.y0, box.x1, lr.y0 - 0.5)
                     pool.append(dict(rect=lower, cls='picture', used=False))
@@ -562,12 +567,60 @@ class FigureItem:
     mixed_with: str | None = None   # 이 표 상자에 다른 표(라벨)가 섞여 있었음
 
 
+ORPHAN_MIN_AREA_CAPTIONED = 0.15   # 캡션이 있는 문서에서 캡션 없는 그림을 넣는 최소 쪽 면적 비율
+ORPHAN_REPEAT_PAGES = 3            # 이만큼 이상의 쪽에 나오는 같은 이미지는 로고·장식으로 보고 뺀다
+
+
+def _orphan_key(page, rect: pymupdf.Rect) -> str:
+    """같은 이미지 판별용 키: 영역 안 래스터 이미지의 내용 해시, 없으면 저해상도 렌더링 해시."""
+    digests = sorted(i['digest'].hex() for i in page.get_image_info(hashes=True)
+                     if pymupdf.Rect(i['bbox']).intersects(rect) and i.get('digest'))
+    if digests:
+        return 'img:' + ','.join(digests)
+    pix = page.get_pixmap(clip=rect, dpi=24, colorspace=pymupdf.csGRAY)
+    return 'pix:' + hashlib.sha1(pix.samples).hexdigest()
+
+
+def _select_orphans(doc, regions: list[dict], include, min_area: float) -> set:
+    """포함할 캡션 없는 그림 영역의 id 집합."""
+    orphans = [r for r in regions if r['kind'] == 'orphan' and r['rect'] is not None]
+    if not orphans or include is False:
+        return set()
+    if include == 'auto':
+        has_captions = any(r['kind'] in ('figure', 'table') for r in regions)
+        min_area = ORPHAN_MIN_AREA_CAPTIONED if has_captions else min_area
+    pages_of: dict = {}
+    keys = {}
+    for r in orphans:
+        keys[id(r)] = _orphan_key(doc[r['page'] - 1], r['rect'])
+        pages_of.setdefault(keys[id(r)], set()).add(r['page'])
+    # 래스터 이미지는 캡션 없는 그림 영역이 아닌 쪽(머리글 등)에 나온 것까지 센다
+    for p in doc:
+        for info in p.get_image_info(hashes=True):
+            if info.get('digest'):
+                for key in pages_of:
+                    if key.startswith('img:') and info['digest'].hex() in key:
+                        pages_of[key].add(p.number + 1)
+    keep = set()
+    for r in orphans:
+        page_area = doc[r['page'] - 1].rect.get_area()
+        if r['rect'].get_area() < min_area * page_area:
+            continue
+        if include == 'auto' and len(pages_of[keys[id(r)]]) >= ORPHAN_REPEAT_PAGES:
+            continue
+        keep.add(id(r))
+    return keep
+
+
 def convert_pdf(pdf_path, out_dir, *, dpi: int = 150, jpg_quality: int = 80, pad: float = 3.0,
-                stem_max: int = 90, include_orphans: bool = False, orphan_min_area: float = 0.04,
+                stem_max: int = 90, include_orphans='auto', orphan_min_area: float = 0.04,
                 formula_images: str = 'garbled', save_image_files: bool = False, progress=None,
                 stem: str | None = None, output_name: str | None = None) -> dict:
     """
     PDF 1개 변환. 반환값: dict(md, images_pdf, items, report)
+    include_orphans: 캡션 없는 그림. 'auto'(기본) = 캡션이 하나도 없는 문서는 쪽 면적 4%(orphan_min_area) 이상,
+                     캡션이 있는 문서는 15% 이상만 포함, 3쪽 이상 반복되는 같은 이미지(로고 등)는 제외.
+                     True = orphan_min_area 이상 모두, False = 모두 제외. 라벨은 'Image p<쪽>-<순번>'
     save_image_files: True면 MD 링크와 같은 경로(<out_dir>/images/<파일명>.jpg)에 개별 이미지도 저장
     progress: 선택. progress(stage: str, done: int, total: int) 콜백 (GUI 진행 표시용)
     stem: 호출 측(pdf_naming)이 이름·중복·경로 길이를 이미 정했으면 그 이름을 그대로 쓴다
@@ -592,17 +645,21 @@ def convert_pdf(pdf_path, out_dir, *, dpi: int = 150, jpg_quality: int = 80, pad
 
     # --- 영역 → 이미지 ---------------------------------------------------------------------
     regions = find_regions(doc, layout, formula_images=formula_images)
+    keep_orphans = _select_orphans(doc, regions, include_orphans, orphan_min_area)
     items: list[FigureItem] = []
     skipped_orphans = 0
+    orphan_no: dict = {}
     short = stem[:40].rstrip('._ ')
     for r in regions:
         if r['rect'] is None:
             continue
         page = doc[r['page'] - 1]
         if r['kind'] == 'orphan':
-            if not include_orphans or r['rect'].get_area() < orphan_min_area * page.rect.get_area():
+            if id(r) not in keep_orphans:
                 skipped_orphans += 1
                 continue
+            orphan_no[r['page']] = orphan_no.get(r['page'], 0) + 1
+            r['label'] = f"Image p{r['page']}-{orphan_no[r['page']]}"
         clip = (r['rect'] + (-pad, -pad, pad, pad)) & page.rect
         pix = page.get_pixmap(clip=clip, dpi=dpi)
         # 번호 사이 구분자는 남긴다: 'Fig 3-2' → Fig3-2 (Fig32와 구분), 'Fig A.1' → FigA.1
@@ -693,6 +750,7 @@ def convert_pdf(pdf_path, out_dir, *, dpi: int = 150, jpg_quality: int = 80, pad
                   figures=sum(1 for i in items if i.kind == 'figure'),
                   tables=sum(1 for i in items if i.kind == 'table'),
                   formulas=sum(1 for i in items if i.kind == 'formula'),
+                  orphans=[i.label for i in items if i.kind == 'orphan'],
                   band_regions=[i.label for i in items if i.how == 'band'],
                   captions_without_region=[r['label'] for r in regions if r['rect'] is None and r['label']],
                   skipped_orphans=skipped_orphans, text_api='internal' if strip_ok else 'public-fallback',

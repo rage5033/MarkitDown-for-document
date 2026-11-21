@@ -90,6 +90,8 @@ def report_summary(res: dict) -> str:
         notes += f" · 확인 필요(band 영역) {len(band)}개: {where}"
     if rep["captions_without_region"]:
         notes += f" · 영역을 못 찾은 캡션: {', '.join(rep['captions_without_region'])}"
+    if rep.get("orphans"):
+        notes += f" · 캡션 없는 그림 {len(rep['orphans'])}개: {', '.join(rep['orphans'][:10])}"
     out = rep["md_bytes"] + rep["images_pdf_bytes"]
     notes += (f" · 용량 원본 {_mb(rep['source_bytes'])} → MD {_mb(rep['md_bytes'])} + 이미지 PDF "
               f"{_mb(rep['images_pdf_bytes'])} ({out / max(1, rep['source_bytes']) * 100:.0f}%)")

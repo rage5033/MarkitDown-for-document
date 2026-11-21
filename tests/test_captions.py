@@ -185,6 +185,45 @@ class BodySentenceAndTablePriority(unittest.TestCase):
         self.assertNotEqual(regions["Fig 10"]["how"], "layout")
 
 
+class OrphanSelection(unittest.TestCase):
+    @staticmethod
+    def doc_with_logo_and_figure(pages=4):
+        doc = pymupdf.open()
+        logo = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, 40, 20), False)
+        logo.set_rect(logo.irect, (200, 30, 30))
+        for _ in range(pages):
+            p = doc.new_page(width=600, height=800)
+            p.insert_image(pymupdf.Rect(20, 20, 140, 80), pixmap=logo)
+        doc[1].draw_rect(pymupdf.Rect(50, 100, 550, 600), color=(0, 0, 0), fill=(0.8, 0.9, 1))
+        doc[2].draw_rect(pymupdf.Rect(50, 100, 250, 260), color=(0, 0, 0), fill=(0.9, 0.8, 1))
+        return doc
+
+    @staticmethod
+    def orphans(doc):
+        rs = [dict(page=n, rect=pymupdf.Rect(20, 20, 140, 80), kind="orphan", label=None) for n in (1, 2, 3, 4)]
+        rs += [dict(page=2, rect=pymupdf.Rect(50, 100, 550, 600), kind="orphan", label=None),   # 52%
+               dict(page=3, rect=pymupdf.Rect(50, 100, 250, 260), kind="orphan", label=None)]   # 6.7%
+        return rs
+
+    def test_no_caption_document_keeps_4pct_and_drops_repeated_logo(self):
+        doc = self.doc_with_logo_and_figure()
+        rs = self.orphans(doc)
+        for r in rs[:4]:
+            r["rect"] = pymupdf.Rect(20, 20, 300, 160)   # logo region big enough (8%) but repeated on 4 pages
+        keep = P._select_orphans(doc, rs, "auto", 0.04)
+        self.assertEqual({rs.index(r) for r in rs if id(r) in keep}, {4, 5})
+
+    def test_captioned_document_keeps_only_15pct(self):
+        doc = self.doc_with_logo_and_figure()
+        rs = self.orphans(doc) + [dict(page=1, rect=pymupdf.Rect(0, 0, 1, 1), kind="figure", label="Fig 1")]
+        keep = P._select_orphans(doc, rs, "auto", 0.04)
+        self.assertEqual({rs.index(r) for r in rs if id(r) in keep}, {4})
+
+    def test_false_keeps_none(self):
+        doc = self.doc_with_logo_and_figure()
+        self.assertEqual(P._select_orphans(doc, self.orphans(doc), False, 0.04), set())
+
+
 class CjkBodyBlocks(unittest.TestCase):
     def test_han_lines_use_20_chars_and_english_lines_keep_40(self):
         self.assertTrue(V.is_body_block(["钠离子电池作为一种新型的电化学储能技术具有", "资源丰富安全性高高低温性能优异高倍率充放"]))
