@@ -449,14 +449,17 @@ _CJK = _HAN + '\u3040-\u30ff\u3000-\u303f\uff00-\uff9f\uffdd-\uffef'
 _CJK_SPACE = re.compile(rf'(?<=[{_CJK}])[ \t]+(?=[{_CJK}])')
 _DIGIT_HAN = re.compile(rf'(?<=[0-9])[ \t]+(?=[{_HAN}])|(?<=[{_HAN}])[ \t]+(?=[0-9])')
 _BEFORE_CLOSE = re.compile(r'(?<=[^\s\uac00-\ud7a3\u1100-\u11ff\u3130-\u318f])[ \t]+(?=[。，、；：！？）」』】])')
+_HANGUL = '\uac00-\ud7a3\u1100-\u11ff\u3130-\u318f\uffa0-\uffdc'
+_AFTER_PUNCT = re.compile(rf'(?<=[。，、；：！？（「『【])[ \t]+(?=[^\s{_HANGUL}])')
 
 
 def cjk_spacing(md: str) -> str:
-    """한자·가나·CJK 구두점·전각 문자 사이, 숫자와 한자 사이, CJK 닫는 구두점 앞의 공백을 지운다
-    (줄바꿈은 그대로). 한글이 붙은 공백은 건드리지 않는다."""
+    """한자·가나·CJK 구두점·전각 문자 사이, 숫자와 한자 사이, CJK 닫는 구두점 앞, '。，、；：！？（「『【' 뒤의
+    공백을 지운다(줄바꿈은 그대로). 한글이 붙은 공백은 건드리지 않는다."""
     md = _CJK_SPACE.sub('', md)
     md = _DIGIT_HAN.sub('', md)
-    return _BEFORE_CLOSE.sub('', md)
+    md = _BEFORE_CLOSE.sub('', md)
+    return _AFTER_PUNCT.sub('', md)
 
 
 def _caption_anchor(md: str, label: str) -> int | None:
